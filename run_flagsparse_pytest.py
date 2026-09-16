@@ -911,6 +911,20 @@ def _stage_name(op: dict[str, object]) -> str | None:
     return None
 
 
+def _delivery_parent_operators(yaml_path: Path) -> set[str] | None:
+    """Operators backing the delivery variants declared in `yaml_path`.
+
+    None when that manifest declares no variants, which is how the caller tells
+    the two manifest shapes apart rather than guessing from the file name.
+    """
+    try:
+        variants = load_delivery_variants(yaml_path)
+    except Exception:
+        return None
+    parents = {str(v["operator"]) for v in variants if v.get("operator")}
+    return parents or None
+
+
 def read_ops(
     *,
     project_root: Path,
@@ -936,6 +950,7 @@ def read_ops(
     if not yaml_path.is_absolute():
         yaml_path = project_root / yaml_path
     catalog = load_operator_catalog(yaml_path)
+    delivery_parents = _delivery_parent_operators(yaml_path) if delivery_only else None
 
     requested_stages = {
         item.strip() for item in stages_arg.split(",") if item.strip()
@@ -946,8 +961,16 @@ def read_ops(
     result = []
     for op in catalog:
         op_id = str(op["id"]).strip()
-        if delivery_only and op.get("reporting") != "delivery":
-            continue
+        if delivery_only:
+            # Two manifest shapes, one meaning: run exactly what the delivery
+            # report will have rows for. The repo manifest says so with
+            # `delivery_variants` (this operator backs one of them); the C API
+            # manifest says so per entry with `reporting: delivery`.
+            if delivery_parents is not None:
+                if op_id not in delivery_parents:
+                    continue
+            elif op.get("reporting") != "delivery":
+                continue
         if op_id in DEFAULT_EXCLUDED_OPS:
             continue
         if start and op_id < start:
@@ -3541,8 +3564,10 @@ def main(
         "--delivery-only",
         action="store_true",
         help=(
-            "Select only reporting: delivery entries when reading a C API "
-            "operators manifest. Ignored by --ops and --op-list."
+            "Run exactly the operators the delivery report has rows for: the "
+            "parents of conf/operators.yaml's delivery_variants, or the "
+            "reporting: delivery entries of a C API manifest. Ignored by "
+            "--ops and --op-list."
         ),
     )
     parser.add_argument(
