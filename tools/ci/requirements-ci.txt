@@ -19,4 +19,4 @@ isort>=5,<6
 pre-commit>=4,<5
 pytest>=8,<9
 ruff>=0.15,<0.16
-twine>=6,<7
+twine>=7.0.0,<8
