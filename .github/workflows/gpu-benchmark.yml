@@ -1,0 +1,130 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: GPU Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      ops:
+        description: >-
+          Comma-separated operator ids to benchmark (keys of OP_TEST_CONFIGS in
+          run_flagsparse_pytest.py). Leave empty to run all configured
+          operators from conf/operators.yaml.
+        required: false
+        type: string
+      matrix_dir:
+        description: MatrixMarket file or directory passed to mtx-backed operators
+        required: true
+        default: tests/data
+        type: string
+      warmup:
+        description: Warmup iterations for operators that support it
+        required: true
+        default: "5"
+        type: string
+      iters:
+        description: Timed iterations for operators that support it
+        required: true
+        default: "20"
+        type: string
+      benchmark_args:
+        description: >-
+          Extra args appended to every performance invocation (e.g.
+          "--no-cusparse" or "--with-cusparse" for operators that support it).
+        required: false
+        type: string
+
+jobs:
+  benchmark:
+    name: Run GPU benchmark
+    runs-on: test-flagsparse
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Initialize artifact paths
+        run: mkdir -p benchmark_results
+
+      - name: Verify runner Python
+        run: python3.12 --version
+
+      - name: Verify benchmark dependencies
+        run: |
+          python3.12 -m pip show build pytest torch
+          python3.12 - <<'PY'
+          import build
+          import pytest
+          import torch
+
+          print("build", getattr(build, "__version__", "unknown"))
+          print("pytest", pytest.__version__)
+          print("torch", torch.__version__)
+          PY
+
+      - name: Install FlagTree Triton
+        shell: bash
+        run: |
+          python3.12 -m pip uninstall -y triton
+          python3.12 -m pip install --upgrade flagtree===0.6.0rc2 \
+            --index-url=https://resource.flagos.net/repository/flagos-pypi-hosted/simple
+          python3.12 - <<'PY'
+          import triton
+
+          print("triton", getattr(triton, "__version__", "unknown"))
+          PY
+
+      - name: Validate CUDA environment
+        run: |
+          nvidia-smi
+          python3.12 tools/ci/check_gpu_environment.py \
+            --require-cuda \
+            --metadata benchmark_results/gpu_metadata.json
+
+      - name: Build source and wheel distributions
+        run: python3.12 -m build
+
+      - name: Install package
+        run: python3.12 -m pip install --force-reinstall --no-deps dist/*.whl
+
+      - name: Validate installed wheel import
+        run: python3.12 tools/ci/check_installed_wheel.py --expected-version 1.0.0
+
+      - name: Run GPU performance benchmarks
+        shell: bash
+        run: |
+          args=(
+            run_flagsparse_performance.py
+            --benchmark-input "${{ inputs.matrix_dir }}"
+            --benchmark-warmup "${{ inputs.warmup }}"
+            --benchmark-iters "${{ inputs.iters }}"
+            --gpus 0
+            --results-dir benchmark_results
+          )
+          if [ -n "${{ inputs.ops }}" ]; then
+            args+=(--ops "${{ inputs.ops }}")
+          fi
+          if [ -n "${{ inputs.benchmark_args }}" ]; then
+            args+=(--benchmark-args "${{ inputs.benchmark_args }}")
+          fi
+          python3.12 "${args[@]}"
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-benchmark-${{ github.run_id }}
+          path: benchmark_results/

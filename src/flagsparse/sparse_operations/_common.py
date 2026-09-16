@@ -1,0 +1,3438 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Shared imports, dtypes, and helpers for FlagSparse sparse ops."""
+
+import ctypes
+import importlib
+import os
+import statistics
+import time
+
+try:
+    import torch
+    import triton
+    import triton.language as tl
+except ImportError as exc:
+    raise ImportError(
+        "Runtime dependencies are missing. Install them manually: pip install torch triton"
+    ) from exc
+
+try:
+    import cupy as cp
+    import cupyx.scipy.sparse as cpx_sparse
+
+    # cupyx.cusparse exposes the *generic* cuSPARSE entry points, notably
+    # ``spmm`` (cusparseSpMM), which accepts a coo_matrix directly and therefore
+    # gives a native COO SpMM baseline.  ``coo_matrix @ B`` cannot: it routes
+    # through cupyx.scipy.sparse._base.__mul__ = ``self.tocsr().__mul__(other)``.
+    import cupyx.cusparse as _cupy_cusparse
+except ImportError:
+    cp = None
+    cpx_sparse = None
+    _cupy_cusparse = None
+
+# DCU/ROCm backend: the vendor reference library is hipSPARSE, reached through the
+# `hip-python` bindings. The import is optional in exactly the same way CuPy is, so a
+# CUDA-only install keeps working unchanged.
+_HIP_IMPORT_ERROR = None
+try:
+    from hip import hip, hipsparse
+    from hip._util.types import Pointer as HipPointer
+except Exception as exc:  # pragma: no cover - depends on the installed runtime
+    hip = None
+    hipsparse = None
+    HipPointer = None
+    _HIP_IMPORT_ERROR = exc
+
+_SUPPORTED_VALUE_DTYPES = [
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+    torch.complex64,
+    torch.complex128,
+]
+SUPPORTED_VALUE_DTYPES = tuple(_SUPPORTED_VALUE_DTYPES)
+SUPPORTED_INDEX_DTYPES = (torch.int32, torch.int64)
+_INDEX_LIMIT_INT32 = 2**31 - 1
+# ---------------------------------------------------------------------------
+# Backend registry.
+#
+# CUDA plus the domestic accelerators.  This used to be a hardcoded tuple with a
+# matching if-chain in _backend_name(); adding a vendor meant editing both, and
+# the two could disagree.  It is a table now, so a new platform is one entry.
+#
+# Each entry carries the signals that identify it, most explicit first:
+#
+#   plugin_modules   the vendor's PyTorch plugin.  The STRONGEST signal, and for
+#                    some vendors the only honest one -- see xpu below.
+#   torch_namespace  the ``torch.<name>`` namespace the plugin installs.
+#   device_tokens    substrings of the device name, for stacks that install no
+#                    namespace of their own (MetaX ships a CUDA-compatible one).
+#
+# ``reserved`` marks the spare slot: it is routed by FLAGSPARSE_BACKEND alone and
+# never auto-detected, so a vendor with no entry of its own can be driven through
+# it without touching this file.
+# ---------------------------------------------------------------------------
+
+
+class _BackendSpec:
+    __slots__ = ("name", "vendor", "torch_namespace", "plugin_modules",
+                 "device_tokens", "reserved")
+
+    def __init__(self, name, vendor, torch_namespace=None, plugin_modules=(),
+                 device_tokens=(), reserved=False):
+        self.name = name
+        self.vendor = vendor
+        self.torch_namespace = torch_namespace
+        self.plugin_modules = tuple(plugin_modules)
+        self.device_tokens = tuple(device_tokens)
+        self.reserved = bool(reserved)
+
+    def __repr__(self):
+        return f"_BackendSpec({self.name!r}, {self.vendor!r})"
+
+
+_BACKEND_SPECS = (
+    _BackendSpec("cuda", "NVIDIA"),
+    # ROCm/DCU is probed from torch.version.hip below, before this table is used.
+    _BackendSpec("rocm", "Hygon DCU / AMD ROCm"),
+    # MetaX ships a CUDA-compatible stack: torch.version.cuda is set and
+    # torch.version.hip is None, so only the device name tells it apart.
+    _BackendSpec("metax", "MetaX MACA", device_tokens=("metax", "maca", "mxc", "xcore")),
+    _BackendSpec("mthreads", "Moore Threads MUSA", "musa", ("torch_musa",),
+                 ("mthreads", "musa")),
+    _BackendSpec("ascend", "Huawei Ascend CANN", "npu", ("torch_npu",),
+                 ("ascend", "910")),
+    # Kunlunxin. The plugin module is REQUIRED and torch.xpu alone is not enough:
+    # upstream PyTorch ships a torch.xpu namespace for Intel GPUs, so accepting
+    # the namespace would claim an Intel card as Kunlunxin silicon.
+    _BackendSpec("xpu", "Kunlunxin XPU", "xpu", ("torch_xmlir", "torch_xpu"),
+                 ("kunlun", "xpu")),
+    _BackendSpec("gcu", "Enflame GCU", "gcu", ("torch_gcu",), ("enflame", "gcu")),
+    # The spare. Named for Cambricon because that is the slot the C++ side
+    # already reserves (BACKEND=MLU), but its contract is "generic reserve":
+    # env-routed only, so any vendor without an entry can be driven through it.
+    _BackendSpec("mlu", "Cambricon MLU (generic reserve slot)", "mlu",
+                 ("torch_mlu",), ("cambricon", "mlu"), reserved=True),
+)
+
+_BACKEND_SPEC_BY_NAME = {spec.name: spec for spec in _BACKEND_SPECS}
+# Defined here (before the runtime probes) because the ROCm probe below needs it.
+_BACKEND_NAMES = tuple(spec.name for spec in _BACKEND_SPECS)
+# torch.version.hip is set only by ROCm/DCU builds of PyTorch, so it is the cheapest
+# reliable way to pick the vendor backend without touching a device.
+_IS_ROCM_RUNTIME = getattr(torch.version, "hip", None) is not None
+if os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower() in _BACKEND_NAMES:
+    _IS_ROCM_RUNTIME = os.environ["FLAGSPARSE_BACKEND"].strip().lower() == "rocm"
+
+# MetaX/MACA (e.g. X201) ships a CUDA-compatible stack: torch.version.cuda is set and
+# torch.version.hip is None, so the ROCm probe above cannot tell it apart from NVIDIA.
+# Detection therefore walks several signals, most explicit first.
+# Vendor/stack tokens, then the concrete Xiyun C-series parts FlagTree's metax
+# backend targets (C550 is the reference platform, C500 the sibling part).
+_MACA_DEVICE_NAME_TOKENS = ("metax", "maca", "mxc", "xcore")
+_MACA_DEVICE_MODEL_TOKENS = ("c550", "c500")
+
+
+def _maca_device_model(device=0):
+    """Normalized MetaX model string, e.g. 'c550'. None when not on MetaX.
+
+    Used to pick per-model tuning: C550 is the only part with measured numbers,
+    so anything else falls back to the C550 profile until it gets its own.
+    """
+    if not _IS_MACA_RUNTIME:
+        return None
+    override = os.environ.get("FLAGSPARSE_MACA_MODEL", "").strip().lower()
+    if override:
+        return override
+    try:
+        name = torch.cuda.get_device_properties(device).name.lower()
+    except Exception:
+        return None
+    for tok in _MACA_DEVICE_MODEL_TOKENS:
+        if tok in name:
+            return tok
+    return None
+
+
+def _backend_override():
+    """FLAGSPARSE_BACKEND, validated. None when unset."""
+    override = os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower()
+    if not override:
+        return None
+    if override not in _BACKEND_NAMES:
+        raise ValueError(
+            "FLAGSPARSE_BACKEND must be one of "
+            f"{', '.join(_BACKEND_NAMES)}; got {override!r}"
+        )
+    return override
+
+
+def _detect_maca_runtime():
+    override = _backend_override()
+    if override:
+        return override == "metax"
+    # A MetaX torch build may expose its own version attribute.
+    for attr in ("maca", "metax"):
+        if getattr(torch.version, attr, None) is not None:
+            return True
+    # MACA SDK environment, present on a configured MetaX host.
+    for env in ("MACA_PATH", "MACA_HOME", "MACA_PATH_CUDA"):
+        if os.environ.get(env):
+            return True
+    # Last resort: the device name, the only signal left when MACA presents itself
+    # as CUDA. Guarded so import never fails on a machine without a GPU.
+    try:
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_properties(0).name.lower()
+            if any(tok in name for tok in _MACA_DEVICE_NAME_TOKENS):
+                return True
+            # A bare model string ("C550") with no vendor prefix still identifies
+            # MetaX, since NVIDIA/AMD parts do not use these names.
+            return any(tok in name for tok in _MACA_DEVICE_MODEL_TOKENS)
+    except Exception:
+        pass
+    return False
+
+
+_IS_MACA_RUNTIME = _detect_maca_runtime()
+
+
+# ── Moore Threads (MUSA) and Ascend (CANN) ──────────────────────────
+# Unlike CUDA/ROCm/MACA these are NOT CUDA-compatible: torch exposes them as a
+# separate device type ('musa' / 'npu') through an out-of-tree extension, so
+# torch.cuda.* and Tensor.is_cuda do not apply. See _accel_* below.
+def _vendor_plugin_present(spec):
+    """Is this vendor's PyTorch plugin actually installed?
+
+    The namespace alone is NOT evidence, and torch.xpu is why: upstream PyTorch
+    ships one for Intel GPUs, so a build with no Kunlunxin plugin still answers
+    getattr(torch, "xpu").  Taking it would run on Intel silicon while reporting
+    Kunlunxin -- or, on a box with the namespace but no device, fail at the first
+    allocation with an error that names neither.
+    """
+    if not spec.plugin_modules:
+        return False
+    for module_name in spec.plugin_modules:
+        try:
+            importlib.import_module(module_name)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _detect_backend_by_spec(name):
+    """Is `name` the backend this process is running on?
+
+    The override wins outright -- that is what makes every slot, including the
+    reserve, reachable on hardware that cannot be probed for.  Otherwise the
+    plugin module decides: a vendor namespace on its own is not proof (upstream
+    PyTorch installs torch.xpu for Intel GPUs), while an importable vendor
+    plugin is.
+    """
+    spec = _BACKEND_SPEC_BY_NAME.get(name)
+    if spec is None:
+        return False
+    override = _backend_override()
+    if override:
+        return override == name
+    if spec.reserved:
+        # The reserve is never claimed by accident: only the override selects it.
+        return False
+    if not _vendor_plugin_present(spec):
+        return False
+    namespace = (getattr(torch, spec.torch_namespace, None)
+                 if spec.torch_namespace else None)
+    if namespace is None:
+        # Plugin present but no namespace: still this vendor's build.
+        return True
+    try:
+        return bool(namespace.is_available())
+    except Exception:
+        return True
+
+
+def _detect_mthreads_runtime():
+    override = _backend_override()
+    if override:
+        return override == "mthreads"
+    if getattr(torch, "musa", None) is not None:
+        try:
+            return bool(torch.musa.is_available())
+        except Exception:
+            return True
+    return False
+
+
+def _detect_ascend_runtime():
+    override = _backend_override()
+    if override:
+        return override == "ascend"
+    if getattr(torch, "npu", None) is not None:
+        try:
+            return bool(torch.npu.is_available())
+        except Exception:
+            return True
+    return False
+
+
+_IS_MTHREADS_RUNTIME = _detect_mthreads_runtime()
+_IS_ASCEND_RUNTIME = _detect_ascend_runtime()
+_IS_XPU_RUNTIME = _detect_backend_by_spec("xpu")
+_IS_GCU_RUNTIME = _detect_backend_by_spec("gcu")
+_IS_MLU_RUNTIME = _detect_backend_by_spec("mlu")
+_CUPY_SPMV_SUPPORTED_VALUE_DTYPES = (
+    torch.float32,
+    torch.float64,
+    torch.complex64,
+    torch.complex128,
+)
+
+# Star-import exposes only non-underscore names unless listed here.
+__all__ = (
+    "SUPPORTED_VALUE_DTYPES",
+    "SUPPORTED_INDEX_DTYPES",
+    "_INDEX_LIMIT_INT32",
+    "_is_complex_dtype",
+    "_gather_values",
+    "_resolve_scatter_value_dtype",
+    "_component_dtype_for_complex",
+    "_tolerance_for_dtype",
+    "_is_rocm_runtime",
+    "_get_device_backend_info",
+    "_clip_num_warps_for_backend",
+    "_clip_block_tile_for_backend",
+    "_backend_launch_overrides",
+    "_spmm_rocm_launch_overrides",
+    "_spmv_rocm_launch_overrides",
+    "_is_maca_runtime",
+    "_is_mthreads_runtime",
+    "_is_ascend_runtime",
+    "_resolve_accel",
+    "_accel_module",
+    "_accel_fallback_reason",
+    "_accel_device_type",
+    "_ACCEL",
+    "_ACCEL_DEVICE_TYPE",
+    "_pytorch_sparse_coo_matrix",
+    "_pytorch_sparse_matrix",
+    "_pytorch_sparse_mm",
+    "_accel_oom_error",
+    "_accel_graph_available",
+    "_is_accel_tensor",
+    "_backend_name",
+    "_maca_device_model",
+    "_maca_vendor_sparse_library",
+    "_mthreads_vendor_sparse_library",
+    "_ascend_vendor_sparse_library",
+    "_is_ops_sparse_available",
+    "_ops_sparse_unavailable_reason",
+    "ops_sparse",
+    "_vendor_sparse_library",
+    "_is_hipsparse_available",
+    "_require_cupy",
+    "_cupy_dtype_from_torch",
+    "_cupy_from_torch",
+    "_torch_from_cupy",
+    "_to_torch_tensor",
+    "_to_backend_like",
+    "_cusparse_baseline_skip_reason",
+    "_cupy_cusparse_spmv_skip_reason",
+    # hipSPARSE / HIP glue shared by the per-operator DCU reference paths.
+    "_hip_check_result",
+    "_hip_lookup",
+    "_hip_runtime_event_available",
+    "_hip_event_elapsed_ms",
+    "_destroy_hip_event",
+    "_hipsparse_lookup",
+    "_hipsparse_unavailable_reason",
+    "_hipsparse_value_type",
+    "_hipsparse_scalar",
+    "_hipsparse_index_type",
+    "_hipsparse_spmv_operation",
+    "_hipsparse_spmm_operation",
+    "_hipsparse_spmm_order",
+    "_hipsparse_spmm_algorithm",
+    "_hipsparse_spmv_algorithm",
+    "_hipsparse_sddmm_algorithm",
+    "_hipsparse_create_coo_descriptor",
+    "_hipsparse_create_csr_descriptor",
+    "_hipsparse_create_dnmat_descriptor",
+    "_hipsparse_create_bsr_descriptor",
+    # Consumed by benchmarks.py through `from ._common import *`.
+    "_prepare_spmv_csr_ref_hipsparse",
+    "_run_spmv_csr_ref_hipsparse_prepared",
+    "_destroy_spmv_csr_ref_hipsparse_prepared",
+    "_hipsparse_create_csc_descriptor",
+    "_hipsparse_create_blocked_ell_descriptor",
+    "_hipsparse_spmv_csc_skip_reason",
+    "_prepare_spmv_csc_ref_hipsparse",
+    "_run_spmv_csc_ref_hipsparse_prepared",
+    "_destroy_spmv_csc_ref_hipsparse_prepared",
+    "_spmv_csc_sparse_ref_backend",
+    "_benchmark_spmv_csc_sparse_ref",
+    "_normalize_spmv_reference_op",
+    "_normalize_sparse_reference_op",
+    "_spmv_reference_compute_dtype",
+    "_sparse_reference_compute_dtype",
+    "_cast_spmv_reference_output",
+    "_cast_sparse_reference_output",
+    "_apply_torch_sparse_matmul_op",
+    "_apply_torch_sparse_spmv_op",
+    "_cupy_spmv_op_matrix",
+    "_apply_cupy_sparse_matmul_op",
+    "_apply_cupy_spmv_op",
+    "_spmv_csr_sparse_ref_backend",
+    "_spmv_csr_reference_backend",
+    "_spmv_csr_ref_pytorch",
+    "_spmv_csr_ref_cupy",
+    "spmv_csr_ref_hipsparse",
+    "_spmv_csr_reference",
+    "_benchmark_spmv_csr_sparse_ref",
+    "_spmv_coo_sparse_ref_backend",
+    "_spmv_coo_reference_backend",
+    "_spmv_coo_ref_pytorch",
+    "_spmv_coo_ref_cupy",
+    "spmv_coo_ref_hipsparse",
+    "_spmv_coo_reference",
+    "_benchmark_spmv_coo_sparse_ref",
+    "_build_random_dense",
+    "_build_indices",
+    "_build_random_csr",
+    "_validate_common_inputs",
+    "_prepare_inputs",
+    "_prepare_scatter_inputs",
+    "_benchmark_cuda_op",
+    "_runtime_backend_label",
+    "_sparse_backend_label",
+    "_expected_vendor_sparse_backend",
+    "_expected_vendor_sparse_label",
+    "_expected_vendor_sparse_short",
+    "_backend_summary_lines",
+    "_torch_current_stream_ptr",
+    "_hip_event_record_stream",
+    "_hip_event_record_current_stream",
+    "_benchmark_prepared_hip_event_op",
+    "_benchmark_prepared_cuda_op",
+    "_benchmark_cuda_graph_op",
+    "cp",
+    "cpx_sparse",
+    "_cupy_cusparse",
+    "hip",
+    "hipsparse",
+    "HipPointer",
+    "time",
+    "torch",
+    "triton",
+    "tl",
+)
+
+
+def _is_complex_dtype(value_dtype):
+    return value_dtype in (torch.complex64, torch.complex128)
+
+
+def _gather_values(values, order):
+    """Gather ``values`` along dim 0 by ``order``; complex-safe on every backend.
+
+    Moore Threads has no complex kernel for advanced indexing -- ``values[order]``
+    raises ``RuntimeError: "IndexMusa" not implemented for 'ComplexFloat'`` -- which
+    breaks every reorder a transposed or COO-sorted operator has to do, while the
+    real dtypes go through fine.  Complex values are therefore gathered through
+    ``view_as_real``: the same bytes in the same order, and the real-dtype index
+    kernel exists everywhere.
+
+    The branch is on **dtype, not backend**, so CUDA/ROCm/MACA keep the exact path
+    they always took for real data and get an equivalent one for complex.  The same
+    split is already how the complex Triton kernels consume these arrays
+    (``view_as_real`` -> interleaved real/imag), so this adds no new concept.
+    """
+    if not _is_complex_dtype(values.dtype):
+        return values[order]
+    real_view = torch.view_as_real(values if values.is_contiguous() else values.contiguous())
+    return torch.view_as_complex(real_view[order].contiguous())
+
+
+def _resolve_scatter_value_dtype(value_dtype, dtype_policy="auto"):
+    dtype_policy = str(dtype_policy).lower()
+    if dtype_policy not in ("auto", "strict"):
+        raise ValueError("dtype_policy must be 'auto' or 'strict'")
+    if isinstance(value_dtype, str):
+        token = value_dtype.strip().lower()
+        mapping = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+            "float64": torch.float64,
+            "complex64": torch.complex64,
+            "complex128": torch.complex128,
+        }
+        if token not in mapping:
+            raise TypeError(f"Unsupported dtype token: {value_dtype}")
+        value_dtype = mapping[token]
+    return value_dtype, False, None
+
+
+def _component_dtype_for_complex(value_dtype):
+    if value_dtype == torch.complex64:
+        return torch.float32
+    if value_dtype == torch.complex128:
+        return torch.float64
+    raise TypeError(f"Unsupported complex dtype: {value_dtype}")
+
+
+def _tolerance_for_dtype(value_dtype):
+    if value_dtype == torch.float16:
+        return 2e-3, 2e-3
+    if value_dtype == torch.bfloat16:
+        return 1e-1, 1e-1
+    if value_dtype in (torch.float32, torch.complex64):
+        return 1e-6, 1e-5
+    if value_dtype in (torch.float64, torch.complex128):
+        return 1e-10, 1e-8
+    return 1e-6, 1e-5
+
+
+def _is_rocm_runtime():
+    return bool(_IS_ROCM_RUNTIME)
+
+
+def _get_device_backend_info(device=None):
+    backend = "hip" if _is_rocm_runtime() else "cuda"
+    default_warp = 64 if backend == "hip" else 32
+    info = {
+        "backend": backend,
+        "device_name": "",
+        "device_warp_size": default_warp,
+        "max_threads_per_block": 1024,
+        "max_threads_per_multi_processor": 0,
+        "multi_processor_count": 0,
+    }
+    if not torch.cuda.is_available():
+        info["backend"] = "unavailable"
+        return info
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    props = torch.cuda.get_device_properties(device)
+    info.update(
+        {
+            "backend": backend,
+            "device_name": str(getattr(props, "name", "")),
+            "device_warp_size": int(getattr(props, "warp_size", default_warp) or default_warp),
+            "max_threads_per_block": int(
+                getattr(props, "max_threads_per_block", 1024) or 1024
+            ),
+            "max_threads_per_multi_processor": int(
+                getattr(props, "max_threads_per_multi_processor", 0) or 0
+            ),
+            "multi_processor_count": int(
+                getattr(props, "multi_processor_count", 0) or 0
+            ),
+        }
+    )
+    return info
+
+
+def _clip_num_warps_for_backend(num_warps, device=None, backend_info=None):
+    info = _get_device_backend_info(device) if backend_info is None else backend_info
+    num_warps = max(1, int(num_warps))
+    wave = max(1, int(info.get("device_warp_size") or 32))
+    max_threads = max(1, int(info.get("max_threads_per_block") or 1024))
+    while num_warps > 1 and num_warps * wave > max_threads:
+        num_warps //= 2
+    return int(num_warps)
+
+
+def _clip_block_tile_for_backend(block_size, *, device=None, backend_info=None):
+    info = _get_device_backend_info(device) if backend_info is None else backend_info
+    block_size = max(1, int(block_size))
+    max_threads = max(1, int(info.get("max_threads_per_block") or 1024))
+    if info.get("backend") == "hip":
+        max_threads = min(max_threads, 512)
+    while block_size > max_threads:
+        block_size = max(1, block_size // 2)
+    return int(block_size)
+
+
+def _backend_launch_overrides(
+    *,
+    kind,
+    fmt,
+    dtype=None,
+    n_dense_cols=None,
+    max_row_nnz=0,
+    nnz=0,
+    block_n=None,
+    block_nnz=None,
+    block_size=None,
+    num_warps=None,
+    num_stages=None,
+    device=None,
+):
+    info = _get_device_backend_info(device)
+    result = {
+        "backend": info["backend"],
+        "device_name": info["device_name"],
+        "device_warp_size": int(info["device_warp_size"]),
+    }
+    if info["backend"] != "hip":
+        return result
+
+    kind = str(kind).strip().lower()
+    fmt = str(fmt).strip().lower()
+    dense_n = max(1, int(n_dense_cols or 1))
+    max_row_nnz = max(0, int(max_row_nnz or 0))
+    nnz = max(0, int(nnz or 0))
+    fp64_like = dtype in (torch.float64, torch.complex128)
+
+    if kind == "spmm":
+        if block_n is None:
+            if dense_n <= 16:
+                block_n = 16
+                default_warps = 1
+            elif dense_n <= 64:
+                block_n = 32 if result["device_warp_size"] >= 64 else 64
+                default_warps = 2
+            else:
+                block_n = 64
+                default_warps = 4
+        else:
+            default_warps = 4
+        if block_nnz is None:
+            block_nnz = 64 if fmt == "csr" else 128
+            if max_row_nnz >= 512 or nnz >= 1_000_000:
+                block_nnz = 128 if fmt == "csr" else 256
+        result.update(
+            {
+                "block_n": int(block_n),
+                "block_nnz": int(block_nnz),
+                "num_warps": _clip_num_warps_for_backend(
+                    default_warps if num_warps is None else num_warps,
+                    backend_info=info,
+                ),
+                "num_stages": int(1 if num_stages is None else num_stages),
+            }
+        )
+        return result
+
+    if kind == "spmv":
+        if block_size is None:
+            block_size = 128 if fp64_like else 256
+        if block_nnz is None:
+            block_nnz = 128 if fp64_like else 256
+            if fmt == "bsr":
+                block_nnz = 64 if fp64_like else 128
+        result.update(
+            {
+                "block_size": _clip_block_tile_for_backend(
+                    block_size, backend_info=info
+                ),
+                "block_nnz": _clip_block_tile_for_backend(
+                    block_nnz, backend_info=info
+                ),
+                "num_warps": _clip_num_warps_for_backend(
+                    4 if num_warps is None else num_warps,
+                    backend_info=info,
+                ),
+                "num_stages": int(1 if num_stages is None else num_stages),
+            }
+        )
+        return result
+
+    raise ValueError(f"unsupported launch override kind: {kind!r}")
+
+
+def _spmm_rocm_launch_overrides(
+    *,
+    n_dense_cols,
+    max_row_nnz=0,
+    nnz=0,
+    fmt="csr",
+    dtype=None,
+    device=None,
+):
+    if not _is_rocm_runtime():
+        return None
+    return _backend_launch_overrides(
+        kind="spmm",
+        fmt=fmt,
+        dtype=dtype,
+        n_dense_cols=n_dense_cols,
+        max_row_nnz=max_row_nnz,
+        nnz=nnz,
+        device=device,
+    )
+
+
+def _spmv_rocm_launch_overrides(
+    *,
+    fmt,
+    dtype=None,
+    max_row_nnz=0,
+    nnz=0,
+    block_size=None,
+    block_nnz=None,
+    num_warps=None,
+    device=None,
+):
+    if not _is_rocm_runtime():
+        return None
+    return _backend_launch_overrides(
+        kind="spmv",
+        fmt=fmt,
+        dtype=dtype,
+        max_row_nnz=max_row_nnz,
+        nnz=nnz,
+        block_size=block_size,
+        block_nnz=block_nnz,
+        num_warps=num_warps,
+        device=device,
+    )
+
+
+def _is_maca_runtime():
+    """True on MetaX/MACA (X201 and friends)."""
+    return bool(_IS_MACA_RUNTIME)
+
+
+def _is_mthreads_runtime():
+    """True on Moore Threads (MUSA)."""
+    return bool(_IS_MTHREADS_RUNTIME)
+
+
+def _is_ascend_runtime():
+    """True on Ascend (CANN / 910B)."""
+    return bool(_IS_ASCEND_RUNTIME)
+
+
+def _is_xpu_runtime():
+    """True on Kunlunxin XPU."""
+    return bool(_IS_XPU_RUNTIME)
+
+
+def _is_gcu_runtime():
+    """True on Enflame GCU."""
+    return bool(_IS_GCU_RUNTIME)
+
+
+def _is_mlu_runtime():
+    """True on the reserve slot (Cambricon MLU, or whatever is routed there)."""
+    return bool(_IS_MLU_RUNTIME)
+
+
+def backend_specs():
+    """The backend registry, for tooling that needs to enumerate platforms.
+
+    Test runners use this instead of their own copy of the list, so a platform
+    added here reaches the accuracy and performance harnesses without a second
+    edit.
+    """
+    return _BACKEND_SPECS
+
+
+# Probe order matters and is not alphabetical: the most specific signal first.
+# CUDA is last because it is the fallthrough -- a MetaX or Kunlunxin stack also
+# answers to torch.version.cuda, so claiming CUDA early would shadow them.
+_BACKEND_PROBES = (
+    ("rocm", lambda: _IS_ROCM_RUNTIME),
+    ("metax", lambda: _IS_MACA_RUNTIME),
+    ("mthreads", lambda: _IS_MTHREADS_RUNTIME),
+    ("ascend", lambda: _IS_ASCEND_RUNTIME),
+    ("xpu", lambda: _IS_XPU_RUNTIME),
+    ("gcu", lambda: _IS_GCU_RUNTIME),
+    ("mlu", lambda: _IS_MLU_RUNTIME),
+)
+
+
+def _backend_name():
+    """Canonical runtime name; one of _BACKEND_NAMES, defaulting to 'cuda'."""
+    for name, probe in _BACKEND_PROBES:
+        if probe():
+            return name
+    return "cuda"
+
+
+def _resolve_accel():
+    """Resolve (module, device_type) together, so they can never disagree.
+
+    CUDA, ROCm and MACA all present themselves as torch.cuda. Every other backend
+    in the registry is a separate device type supplied by an out-of-tree torch
+    extension; when that extension is not importable we fall back to
+    torch.cuda/"cuda" *as a pair* — returning torch.cuda while claiming device
+    type "musa" would make _is_accel_tensor() reject every tensor.
+
+    Driven from the registry rather than an if-chain, so a backend added there
+    does not end up reporting its own name while running on torch.cuda.
+    """
+    name = _backend_name()
+    spec = _BACKEND_SPEC_BY_NAME.get(name)
+    # cuda / rocm / metax carry no namespace of their own: they all answer to
+    # torch.cuda, which is why the registry leaves torch_namespace unset for them.
+    if spec is not None and spec.torch_namespace and _vendor_plugin_present(spec):
+        mod = getattr(torch, spec.torch_namespace, None)
+        if mod is not None:
+            # The namespace name doubles as the torch device type for every
+            # out-of-tree backend here (musa, npu, xpu, gcu, mlu).
+            return mod, spec.torch_namespace
+    return torch.cuda, "cuda"
+
+
+def _accel_module():
+    """The torch submodule driving this backend: torch.cuda / .musa / .npu."""
+    return _resolve_accel()[0]
+
+
+def _accel_device_type():
+    """Device type string for torch.device(): 'cuda' | 'musa' | 'npu'."""
+    return _resolve_accel()[1]
+
+
+def _accel_fallback_reason():
+    """Why the accelerator module fell back to torch.cuda, or None.
+
+    Non-None means the selected backend's torch extension is missing, so the
+    package is running on torch.cuda despite FLAGSPARSE_BACKEND asking otherwise.
+    """
+    if _IS_MTHREADS_RUNTIME and getattr(torch, "musa", None) is None:
+        return "backend 'mthreads' selected but torch.musa is unavailable (torch_musa not installed?); falling back to torch.cuda"
+    if _IS_ASCEND_RUNTIME and getattr(torch, "npu", None) is None:
+        return "backend 'ascend' selected but torch.npu is unavailable (torch_npu not installed?); falling back to torch.cuda"
+    return None
+
+
+def _is_accel_tensor(t):
+    """Backend-neutral replacement for Tensor.is_cuda."""
+    return getattr(t, "device", None) is not None and t.device.type == _ACCEL_DEVICE_TYPE
+
+
+def _pytorch_sparse_coo_matrix(data, indices, indptr, shape):
+    """CSR arrays -> a coalesced PyTorch sparse COO tensor."""
+    n_rows = int(shape[0])
+    offsets = indptr.to(torch.int64)
+    row_indices = torch.repeat_interleave(
+        torch.arange(n_rows, device=data.device, dtype=torch.int64),
+        offsets[1:] - offsets[:-1],
+    )
+    return torch.sparse_coo_tensor(
+        torch.stack((row_indices, indices.to(torch.int64))),
+        data,
+        size=shape,
+        device=data.device,
+    ).coalesce()
+
+
+def _pytorch_sparse_matrix(data, indices, indptr, shape):
+    """Create the portable PyTorch sparse baseline matrix for this runtime.
+
+    MACA PyTorch's CSR float32 kernel is unstable with int64 CSR indices, so use int32
+    CSR when the matrix fits and COO with int64 coordinates when it does not.  Other
+    backends keep the historical int64 CSR path.
+    """
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    fits_int32 = (
+        n_rows <= _INDEX_LIMIT_INT32
+        and n_cols <= _INDEX_LIMIT_INT32
+        and int(data.numel()) <= _INDEX_LIMIT_INT32
+    )
+    if _IS_MACA_RUNTIME and not fits_int32:
+        return _pytorch_sparse_coo_matrix(data, indices, indptr, shape), "COO"
+    index_dtype = torch.int32 if _IS_MACA_RUNTIME else torch.int64
+    return (
+        torch.sparse_csr_tensor(
+            indptr.to(index_dtype),
+            indices.to(index_dtype),
+            data,
+            size=shape,
+            device=data.device,
+        ),
+        "CSR",
+    )
+
+
+def _pytorch_sparse_mm(data, indices, indptr, shape, rhs, op="non"):
+    """Run a PyTorch sparse baseline, retrying MACA's non-finite CSR output as COO."""
+    token = str(op).lower()
+
+    def run(matrix):
+        if token == "non":
+            return torch.sparse.mm(matrix, rhs)
+        if token == "trans":
+            return torch.sparse.mm(matrix.transpose(0, 1), rhs)
+        if token == "conj":
+            matrix = matrix.conj() if torch.is_complex(matrix) else matrix
+            return torch.sparse.mm(matrix.transpose(0, 1), rhs)
+        raise ValueError(f"unsupported sparse operation: {op}")
+
+    matrix, sparse_format = _pytorch_sparse_matrix(data, indices, indptr, shape)
+    result = run(matrix)
+    if _IS_MACA_RUNTIME and not bool(torch.isfinite(result).all()):
+        result = run(_pytorch_sparse_coo_matrix(data, indices, indptr, shape))
+        sparse_format = "COO"
+    return result, sparse_format
+
+
+def _accel_oom_error():
+    """The backend's OOM exception type, for `except` clauses."""
+    exc = getattr(_ACCEL, "OutOfMemoryError", None)
+    if isinstance(exc, type) and issubclass(exc, BaseException):
+        return exc
+    return torch.cuda.OutOfMemoryError
+
+
+def _accel_graph_available():
+    """Whether this backend exposes CUDA-Graph-style capture.
+
+    MUSA and Ascend may not; callers must fall back to plain event timing.
+    """
+    return hasattr(_ACCEL, "graph") and hasattr(_ACCEL, "CUDAGraph")
+
+
+# Cached accelerator handles. On CUDA, ROCm and MACA these are exactly
+# torch.cuda / "cuda", so every _ACCEL.* call below is identical to the
+# torch.cuda.* it replaced. Only MUSA and Ascend see a different module.
+_ACCEL = _accel_module()
+_ACCEL_DEVICE_TYPE = _accel_device_type()
+
+
+def _maca_vendor_sparse_library():
+    """Which vendor sparse library MetaX/MACA uses for reference baselines.
+
+    MACA is CUDA-source-compatible, so CuPy/cuSPARSE-style calls are the working
+    default until a native mcSPARSE binding is wired up. Override with
+    FLAGSPARSE_MACA_VENDOR=cupy_cusparse|none.
+    """
+    override = os.environ.get("FLAGSPARSE_MACA_VENDOR", "").strip().lower()
+    if override in ("cupy_cusparse", "none"):
+        return None if override == "none" else override
+    if override:
+        raise ValueError(
+            "FLAGSPARSE_MACA_VENDOR must be 'cupy_cusparse' or 'none', "
+            f"got {override!r}"
+        )
+    return "cupy_cusparse"
+
+
+def _mthreads_vendor_sparse_library():
+    """Baseline library on Moore Threads: none by default.
+
+    This used to default to "torch" on the assumption that torch.sparse "runs on
+    MUSA today and gives a real reference".  Measured on an MTT S5000
+    (torch 2.7.1 / torch_musa 2.7.1, muDNN v3105) with
+    ``tools/probe_accel_capabilities.py``, that is false -- torch.sparse has no
+    working matmul on MUSA in any layout or dtype, float32 included:
+
+        CSR: NotImplementedError: Could not run 'aten::empty.memory_format'
+             with arguments from the 'SparseCsrmusa' backend
+        COO: NotImplementedError: Could not run 'aten::addmm'
+             with arguments from the 'Sparsemusa' backend
+
+    Building a sparse tensor succeeds, which is why the gap survived review; only
+    the multiply is missing.  Returning "torch" therefore produced a baseline column
+    that raises rather than one that measures, so the default is now no vendor
+    baseline: the vendor columns report N/A with a reason, and FlagSparse timings
+    are still collected.
+
+    muSPARSE remains unwired (no Python binding here).  Override with
+    FLAGSPARSE_MTHREADS_VENDOR=torch|musparse|none -- "torch" stays available so the
+    default can be flipped back by measurement once torch_musa registers the ops,
+    rather than by assumption.
+    """
+    override = os.environ.get("FLAGSPARSE_MTHREADS_VENDOR", "").strip().lower()
+    if override in ("torch", "musparse", "none"):
+        return None if override == "none" else override
+    if override:
+        raise ValueError(
+            "FLAGSPARSE_MTHREADS_VENDOR must be 'torch', 'musparse' or 'none'; "
+            f"got {override!r}"
+        )
+    return None
+
+
+_OPS_SPARSE_IMPORT_ERROR = None
+try:  # Ascend vendor sparse library (CANN ops-sparse).
+    import ops_sparse  # type: ignore
+except Exception as exc:  # pragma: no cover - depends on the installed runtime
+    ops_sparse = None
+    _OPS_SPARSE_IMPORT_ERROR = exc
+
+
+def _is_ops_sparse_available():
+    return ops_sparse is not None
+
+
+def _ops_sparse_unavailable_reason():
+    if ops_sparse is not None:
+        return None
+    if not _IS_ASCEND_RUNTIME:
+        return "ops-sparse requires an Ascend/CANN runtime"
+    reason = "Ascend runtime detected but the ops-sparse library is unavailable"
+    if _OPS_SPARSE_IMPORT_ERROR is not None:
+        reason += f": {_OPS_SPARSE_IMPORT_ERROR}"
+    return reason
+
+
+def _ascend_vendor_sparse_library():
+    """Baseline library on Ascend: CANN's ops-sparse when importable.
+
+    Falls back to torch.sparse when it is not. Override with
+    FLAGSPARSE_ASCEND_VENDOR=ops_sparse|torch|none.
+    """
+    override = os.environ.get("FLAGSPARSE_ASCEND_VENDOR", "").strip().lower()
+    if override in ("ops_sparse", "torch", "none"):
+        return None if override == "none" else override
+    if override:
+        raise ValueError(
+            "FLAGSPARSE_ASCEND_VENDOR must be 'ops_sparse', 'torch' or 'none'; "
+            f"got {override!r}"
+        )
+    return "ops_sparse" if _is_ops_sparse_available() else "torch"
+
+
+def _vendor_sparse_library():
+    """Vendor sparse library for this runtime, or None when there is none.
+
+    hipsparse (ROCm) | cupy_cusparse (CUDA, MACA) | torch (MUSA) |
+    ops_sparse (Ascend, when installed) | None
+    """
+    if _IS_ROCM_RUNTIME:
+        return "hipsparse"
+    if _IS_MACA_RUNTIME:
+        return _maca_vendor_sparse_library()
+    if _IS_MTHREADS_RUNTIME:
+        return _mthreads_vendor_sparse_library()
+    if _IS_ASCEND_RUNTIME:
+        return _ascend_vendor_sparse_library()
+    return "cupy_cusparse"
+
+
+def _runtime_backend_label():
+    """Human-readable runtime backend label for benchmark scripts."""
+    return {
+        "cuda": "CUDA",
+        "rocm": "ROCm/DCU",
+        "metax": "MetaX/MACA",
+        "mthreads": "Moore Threads/MUSA",
+        "ascend": "Ascend/CANN",
+    }.get(_backend_name(), _backend_name())
+
+
+def _sparse_backend_label(backend):
+    """Human-readable sparse-library label for benchmark scripts."""
+    return {
+        "hipsparse": "hipSPARSE",
+        "cupy_cusparse": "CuPy/cuSPARSE",
+        "native_cusparse": "native cuSPARSE",
+        "torch": "PyTorch",
+        "musparse": "muSPARSE",
+        "ops_sparse": "ops-sparse",
+        None: "N/A",
+    }.get(backend, str(backend))
+
+
+def _expected_vendor_sparse_backend():
+    """Return the sparse-library baseline selected for the active backend."""
+    return _vendor_sparse_library()
+
+
+def _expected_vendor_sparse_label():
+    return _sparse_backend_label(_expected_vendor_sparse_backend())
+
+
+def _expected_vendor_sparse_short():
+    backend = _expected_vendor_sparse_backend()
+    return {
+        "hipsparse": "HS",
+        "cupy_cusparse": "CU",
+        "native_cusparse": "CU",
+        "torch": "PT",
+        "musparse": "MS",
+        "ops_sparse": "OPS",
+        None: "N/A",
+    }.get(backend, str(backend).upper())
+
+
+def _backend_summary_lines(
+    *,
+    op_name,
+    native_format,
+    correctness_ref,
+    vendor_backend=None,
+    vendor_reason=None,
+    run_vendor=True,
+):
+    """Return standard benchmark header lines for runtime/vendor reporting."""
+    lines = [
+        f"Runtime backend: {_runtime_backend_label()}",
+        f"FlagSparse native path: {op_name} ({native_format})",
+        f"Correctness ref: {correctness_ref}",
+    ]
+    if not run_vendor:
+        lines.append("Vendor sparse baseline: disabled")
+    elif vendor_backend is None:
+        reason = vendor_reason or "no matching vendor sparse baseline"
+        lines.append(f"Vendor sparse baseline: N/A ({reason})")
+    else:
+        lines.append(f"Vendor sparse baseline: {_sparse_backend_label(vendor_backend)}")
+    return lines
+
+
+def _is_hipsparse_available():
+    return hip is not None and hipsparse is not None and HipPointer is not None
+
+
+def _require_cupy():
+    if cp is None or cpx_sparse is None:
+        raise RuntimeError(
+            "CuPy is required for cuSPARSE baseline. "
+            "Install a CUDA-matched wheel, for example: pip install cupy-cuda12x"
+        )
+
+
+def _cupy_dtype_from_torch(torch_dtype):
+    _require_cupy()
+    mapping = {
+        torch.float16: cp.float16,
+        # Keep cuSPARSE baseline stable for bf16 by computing in fp32 on CuPy path.
+        torch.bfloat16: cp.float32,
+        torch.float32: cp.float32,
+        torch.float64: cp.float64,
+        torch.complex64: cp.complex64,
+        torch.complex128: cp.complex128,
+        torch.int32: cp.int32,
+        torch.int64: cp.int64,
+    }
+    if torch_dtype not in mapping:
+        raise TypeError(f"Unsupported dtype conversion to CuPy: {torch_dtype}")
+    return mapping[torch_dtype]
+
+
+def _cupy_from_torch(tensor):
+    _require_cupy()
+    return cp.from_dlpack(torch.utils.dlpack.to_dlpack(tensor))
+
+
+def _torch_from_cupy(array):
+    try:
+        dlpack_capsule = array.toDlpack()
+    except AttributeError:
+        dlpack_capsule = array.to_dlpack()
+    return torch.utils.dlpack.from_dlpack(dlpack_capsule)
+
+
+def _to_torch_tensor(x, name):
+    if torch.is_tensor(x):
+        return x, "torch"
+    if cp is not None and isinstance(x, cp.ndarray):
+        return _torch_from_cupy(x), "cupy"
+    raise TypeError(f"{name} must be a torch.Tensor or cupy.ndarray")
+
+
+def _to_backend_like(torch_tensor, ref_obj):
+    if cp is not None and isinstance(ref_obj, cp.ndarray):
+        return _cupy_from_torch(torch_tensor)
+    return torch_tensor
+
+
+def _cusparse_baseline_skip_reason(value_dtype):
+    if value_dtype == torch.bfloat16:
+        return "bfloat16 is not supported by the cuSPARSE baseline path; skipped"
+    if cp is None and value_dtype == torch.float16:
+        return "float16 is not supported by torch sparse fallback when CuPy is unavailable; skipped"
+    return None
+
+
+def _normalize_spmv_reference_op(op):
+    if op is None:
+        return "non"
+    if isinstance(op, str):
+        token = op.strip().lower()
+        if token in ("non", "trans", "conj"):
+            return token
+        raise ValueError("op must be one of: non, trans, conj")
+    try:
+        op_code = int(op)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("op must be one of: non, trans, conj") from exc
+    mapping = {0: "non", 1: "trans", 2: "conj"}
+    if op_code not in mapping:
+        raise ValueError("op must be one of: non, trans, conj")
+    return mapping[op_code]
+
+
+def _normalize_sparse_reference_op(op):
+    return _normalize_spmv_reference_op(op)
+
+
+def _spmv_reference_compute_dtype(value_dtype):
+    if value_dtype in (torch.float16, torch.bfloat16):
+        return torch.float32
+    if value_dtype == torch.float32:
+        return torch.float64
+    if value_dtype == torch.complex64:
+        return torch.complex128
+    return value_dtype
+
+
+def _sparse_reference_compute_dtype(value_dtype):
+    return _spmv_reference_compute_dtype(value_dtype)
+
+
+def _cast_spmv_reference_output(y_ref, out_dtype):
+    return y_ref.to(out_dtype) if y_ref.dtype != out_dtype else y_ref
+
+
+def _cast_sparse_reference_output(y_ref, out_dtype):
+    return _cast_spmv_reference_output(y_ref, out_dtype)
+
+
+def _apply_torch_sparse_matmul_op(matrix, rhs, op):
+    op_name = _normalize_sparse_reference_op(op)
+    rhs_is_vector = rhs.ndim == 1
+    rhs_2d = rhs.unsqueeze(1) if rhs_is_vector else rhs
+    if op_name == "non":
+        result = torch.sparse.mm(matrix, rhs_2d)
+    elif op_name == "trans":
+        result = torch.sparse.mm(matrix.transpose(0, 1), rhs_2d)
+    else:
+        result = torch.sparse.mm(matrix.conj().transpose(0, 1), rhs_2d)
+    return result.squeeze(1) if rhs_is_vector else result
+
+
+def _apply_torch_sparse_spmv_op(matrix, vector_2d, op):
+    return _apply_torch_sparse_matmul_op(matrix, vector_2d, op)
+
+
+def _cupy_spmv_op_matrix(matrix, op):
+    op_name = _normalize_spmv_reference_op(op)
+    if op_name == "non":
+        return matrix
+    if op_name == "trans":
+        return matrix.T
+    matrix_conj = matrix.conj() if hasattr(matrix, "conj") else matrix.conjugate()
+    return matrix_conj.T
+
+
+def _apply_cupy_sparse_matmul_op(matrix, rhs, op):
+    return _cupy_spmv_op_matrix(matrix, op) @ rhs
+
+
+def _apply_cupy_spmv_op(matrix, vector, op):
+    return _apply_cupy_sparse_matmul_op(matrix, vector, op)
+
+
+def _hipsparse_status_success(status):
+    try:
+        return int(status) == 0
+    except Exception:
+        pass
+    value = getattr(status, "value", None)
+    if value is not None:
+        try:
+            return int(value) == 0
+        except Exception:
+            pass
+    name = getattr(status, "name", None)
+    if isinstance(name, str):
+        return name.upper().endswith("SUCCESS")
+    text = str(status).strip()
+    return text == "0" or text.upper().endswith("SUCCESS")
+
+
+def _hip_check_result(result, call_name):
+    payload = None
+    status = result
+    if isinstance(result, tuple):
+        if not result:
+            raise RuntimeError(f"{call_name} returned an empty result")
+        status = result[0]
+        if len(result) == 2:
+            payload = result[1]
+        elif len(result) > 2:
+            payload = result[1:]
+    if not _hipsparse_status_success(status):
+        raise RuntimeError(f"{call_name} failed: {status}")
+    return payload
+
+
+def _hip_runtime_event_available():
+    if hip is None:
+        return False
+    required_symbols = (
+        "hipEventCreate",
+        "hipEventRecord",
+        "hipEventSynchronize",
+        "hipEventElapsedTime",
+        "hipEventDestroy",
+    )
+    return all(hasattr(hip, symbol) for symbol in required_symbols)
+
+
+def _hip_event_elapsed_ms(start_evt, stop_evt):
+    raw = hip.hipEventElapsedTime(start_evt, stop_evt)
+    if not isinstance(raw, tuple) or len(raw) != 2:
+        raise RuntimeError(f"hipEventElapsedTime returned unexpected result: {raw!r}")
+    status, elapsed_ms = raw
+    if not _hipsparse_status_success(status):
+        raise RuntimeError(f"hipEventElapsedTime failed: {status}")
+    try:
+        return float(elapsed_ms)
+    except Exception as exc:
+        raise RuntimeError(
+            f"hipEventElapsedTime returned a non-numeric elapsed value: {raw!r}"
+        ) from exc
+
+
+def _destroy_hip_event(evt):
+    if evt is None or hip is None or not hasattr(hip, "hipEventDestroy"):
+        return
+    try:
+        _hip_check_result(hip.hipEventDestroy(evt), "hipEventDestroy")
+    except Exception:
+        pass
+
+
+def _torch_current_stream_ptr():
+    stream = _ACCEL.current_stream()
+    for attr_name in ("cuda_stream", "hip_stream"):
+        stream_ptr = getattr(stream, attr_name, None)
+        if callable(stream_ptr):
+            stream_ptr = stream_ptr()
+        if stream_ptr is not None:
+            return int(stream_ptr)
+    return None
+
+
+def _hip_event_record_stream(evt, stream, call_name):
+    if stream == "current":
+        stream_ptr = _torch_current_stream_ptr()
+        if stream_ptr is None:
+            raise RuntimeError("could not resolve torch current CUDA/HIP stream pointer")
+    else:
+        stream_ptr = int(stream)
+    if stream_ptr == 0:
+        stream_args = (0, ctypes.c_void_p(0))
+    else:
+        stream_args = (ctypes.c_void_p(stream_ptr), stream_ptr)
+    last_error = None
+    for stream_arg in stream_args:
+        try:
+            _hip_check_result(hip.hipEventRecord(evt, stream_arg), call_name)
+            return
+        except TypeError as exc:
+            last_error = exc
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(
+        f"{call_name} failed for stream {stream_ptr}: {last_error}"
+    ) from last_error
+
+
+def _hip_event_record_current_stream(evt, call_name):
+    _hip_event_record_stream(evt, "current", call_name)
+
+
+def _hipsparse_lookup(container_name, attr_names):
+    container = getattr(hipsparse, container_name, None) if hipsparse is not None else None
+    search_spaces = [container, hipsparse]
+    for space in search_spaces:
+        if space is None:
+            continue
+        for attr_name in attr_names:
+            if hasattr(space, attr_name):
+                return getattr(space, attr_name)
+    names = ", ".join(attr_names)
+    raise RuntimeError(f"Unable to resolve hipSPARSE attribute {names}")
+
+
+def _hip_lookup(container_name, attr_names):
+    container = getattr(hip, container_name, None) if hip is not None else None
+    search_spaces = [container, hip]
+    for space in search_spaces:
+        if space is None:
+            continue
+        for attr_name in attr_names:
+            if hasattr(space, attr_name):
+                return getattr(space, attr_name)
+    names = ", ".join(attr_names)
+    raise RuntimeError(f"Unable to resolve HIP attribute {names}")
+
+
+def _hipsparse_unavailable_reason():
+    if _is_hipsparse_available():
+        return None
+    if not _is_rocm_runtime():
+        return "hip-python/hipSPARSE requires a ROCm runtime"
+    reason = "ROCm runtime detected but hip-python/hipSPARSE is unavailable"
+    if _HIP_IMPORT_ERROR is not None:
+        reason += f": {_HIP_IMPORT_ERROR}"
+    return reason
+
+
+def _hipsparse_create_coo_descriptor(
+    spmat_ref,
+    n_rows,
+    n_cols,
+    nnz,
+    row_ptr,
+    col_ptr,
+    values_ptr,
+    index_type,
+    index_base,
+    value_type,
+):
+    # hip-python sparse descriptors follow the same out-parameter form as
+    # dense descriptors: callers create a descriptor object and pass
+    # descriptor.createRef() as the first argument. Some wrappers also split
+    # the COO index type in two.
+    attempts = (
+        (
+            spmat_ref,
+            n_rows,
+            n_cols,
+            nnz,
+            row_ptr,
+            col_ptr,
+            values_ptr,
+            index_type,
+            index_base,
+            value_type,
+        ),
+        (
+            spmat_ref,
+            n_rows,
+            n_cols,
+            nnz,
+            row_ptr,
+            col_ptr,
+            values_ptr,
+            index_type,
+            index_type,
+            index_base,
+            value_type,
+        ),
+    )
+    last_error = None
+    for args in attempts:
+        try:
+            return _hip_check_result(
+                hipsparse.hipsparseCreateCoo(*args), "hipsparseCreateCoo"
+            )
+        except TypeError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise RuntimeError(
+            f"hipsparseCreateCoo wrapper signature mismatch: {last_error}"
+        ) from last_error
+    raise RuntimeError("hipsparseCreateCoo wrapper signature mismatch")
+
+
+def _hipsparse_create_csc_descriptor(
+    spmat_ref,
+    n_rows,
+    n_cols,
+    nnz,
+    col_ptr,
+    row_ptr,
+    values_ptr,
+    col_index_type,
+    row_index_type,
+    index_base,
+    value_type,
+):
+    # The operand order is (colOffsets, rowInd) rather than
+    # (rowOffsets, colInd).
+    return _hip_check_result(
+        hipsparse.hipsparseCreateCsc(
+            spmat_ref,
+            n_rows,
+            n_cols,
+            nnz,
+            col_ptr,
+            row_ptr,
+            values_ptr,
+            col_index_type,
+            row_index_type,
+            index_base,
+            value_type,
+        ),
+        "hipsparseCreateCsc",
+    )
+
+
+def _hipsparse_create_csr_descriptor(
+    spmat_ref,
+    n_rows,
+    n_cols,
+    nnz,
+    row_ptr,
+    col_ptr,
+    values_ptr,
+    row_index_type,
+    col_index_type,
+    index_base,
+    value_type,
+):
+    return _hip_check_result(
+        hipsparse.hipsparseCreateCsr(
+            spmat_ref,
+            n_rows,
+            n_cols,
+            nnz,
+            row_ptr,
+            col_ptr,
+            values_ptr,
+            row_index_type,
+            col_index_type,
+            index_base,
+            value_type,
+        ),
+        "hipsparseCreateCsr",
+    )
+
+
+def _hipsparse_create_bsr_descriptor(
+    spmat_ref,
+    bsr_rows,
+    bsr_cols,
+    nnzb,
+    row_block_dim,
+    col_block_dim,
+    row_ptr,
+    col_ptr,
+    values_ptr,
+    row_index_type,
+    col_index_type,
+    index_base,
+    value_type,
+    order,
+):
+    """Create a hipSPARSE generic BSR descriptor across wrapper signatures."""
+    if not hasattr(hipsparse, "hipsparseCreateBsr"):
+        raise RuntimeError("hipSPARSE binding does not expose hipsparseCreateBsr")
+    attempts = (
+        (
+            spmat_ref,
+            bsr_rows,
+            bsr_cols,
+            nnzb,
+            row_block_dim,
+            col_block_dim,
+            row_ptr,
+            col_ptr,
+            values_ptr,
+            row_index_type,
+            col_index_type,
+            index_base,
+            value_type,
+            order,
+        ),
+        (
+            spmat_ref,
+            bsr_rows,
+            bsr_cols,
+            nnzb,
+            row_block_dim,
+            col_block_dim,
+            row_ptr,
+            col_ptr,
+            values_ptr,
+            row_index_type,
+            col_index_type,
+            index_base,
+            value_type,
+        ),
+        (
+            spmat_ref,
+            bsr_rows,
+            bsr_cols,
+            nnzb,
+            row_ptr,
+            col_ptr,
+            values_ptr,
+            row_index_type,
+            col_index_type,
+            index_base,
+            value_type,
+            row_block_dim,
+            col_block_dim,
+            order,
+        ),
+    )
+    last_error = None
+    for args in attempts:
+        try:
+            return _hip_check_result(
+                hipsparse.hipsparseCreateBsr(*args), "hipsparseCreateBsr"
+            )
+        except TypeError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise RuntimeError(
+            f"hipsparseCreateBsr wrapper signature mismatch: {last_error}"
+        ) from last_error
+    raise RuntimeError("hipsparseCreateBsr wrapper signature mismatch")
+
+
+def _hipsparse_create_blocked_ell_descriptor(
+    spmat_ref,
+    n_rows,
+    n_cols,
+    block_dim,
+    ell_cols,
+    indices_ptr,
+    values_ptr,
+    index_type,
+    index_base,
+    value_type,
+):
+    """Create a hipSPARSE generic Blocked-ELL descriptor."""
+    if not hasattr(hipsparse, "hipsparseCreateBlockedEll"):
+        raise RuntimeError(
+            "hipSPARSE binding does not expose hipsparseCreateBlockedEll"
+        )
+    attempts = (
+        (
+            spmat_ref,
+            n_rows,
+            n_cols,
+            block_dim,
+            ell_cols,
+            indices_ptr,
+            values_ptr,
+            index_type,
+            index_base,
+            value_type,
+        ),
+        (
+            spmat_ref,
+            n_rows,
+            n_cols,
+            block_dim,
+            ell_cols,
+            values_ptr,
+            indices_ptr,
+            index_type,
+            index_base,
+            value_type,
+        ),
+    )
+    last_error = None
+    for args in attempts:
+        try:
+            return _hip_check_result(
+                hipsparse.hipsparseCreateBlockedEll(*args),
+                "hipsparseCreateBlockedEll",
+            )
+        except TypeError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise RuntimeError(
+            f"hipsparseCreateBlockedEll wrapper signature mismatch: {last_error}"
+        ) from last_error
+    raise RuntimeError("hipsparseCreateBlockedEll wrapper signature mismatch")
+
+
+def _hipsparse_spmm_order(order_name, context):
+    mapping = {
+        "row": ("HIPSPARSE_ORDER_ROW",),
+        "col": ("HIPSPARSE_ORDER_COL",),
+    }
+    if order_name not in mapping:
+        raise RuntimeError(f"{context} does not support dense order={order_name}")
+    return _hipsparse_lookup("hipsparseOrder_t", mapping[order_name])
+
+
+def _hipsparse_spmm_algorithm(format_name):
+    format_name = str(format_name).lower()
+    mapping = {
+        "csr": (
+            "HIPSPARSE_SPMM_CSR_ALG1",
+            "HIPSPARSE_SPMM_ALG_DEFAULT",
+        ),
+        "coo": (
+            "HIPSPARSE_SPMM_COO_ALG1",
+            "HIPSPARSE_COOMM_ALG1",
+            "HIPSPARSE_SPMM_ALG_DEFAULT",
+        ),
+        "bell": (
+            "HIPSPARSE_SPMM_BLOCKED_ELL_ALG1",
+            "HIPSPARSE_SPMM_ALG_DEFAULT",
+        ),
+    }
+    if format_name not in mapping:
+        raise RuntimeError(f"hipSPARSE SpMM does not support format={format_name}")
+    return _hipsparse_lookup("hipsparseSpMMAlg_t", mapping[format_name])
+
+
+def _hipsparse_spmv_algorithm(format_name):
+    format_name = str(format_name).lower()
+    mapping = {
+        "csr": ("HIPSPARSE_SPMV_ALG_DEFAULT", "HIPSPARSE_MV_ALG_DEFAULT"),
+        "coo": ("HIPSPARSE_SPMV_ALG_DEFAULT", "HIPSPARSE_MV_ALG_DEFAULT"),
+        "csc": ("HIPSPARSE_SPMV_ALG_DEFAULT", "HIPSPARSE_MV_ALG_DEFAULT"),
+        "bsr": ("HIPSPARSE_SPMV_BSR_ALG1", "HIPSPARSE_SPMV_ALG_DEFAULT"),
+    }
+    if format_name not in mapping:
+        raise RuntimeError(f"hipSPARSE SpMV does not support format={format_name}")
+    return _hipsparse_lookup("hipsparseSpMVAlg_t", mapping[format_name])
+
+
+def _hipsparse_sddmm_algorithm():
+    return _hipsparse_lookup(
+        "hipsparseSDDMMAlg_t",
+        ("HIPSPARSE_SDDMM_ALG_DEFAULT",),
+    )
+
+
+def _hipsparse_create_dnmat_descriptor(
+    mat_ref,
+    rows,
+    cols,
+    ld,
+    values_ptr,
+    value_type,
+    order,
+):
+    attempts = (
+        (mat_ref, rows, cols, ld, values_ptr, value_type, order),
+    )
+    last_error = None
+    for args in attempts:
+        try:
+            return _hip_check_result(
+                hipsparse.hipsparseCreateDnMat(*args), "hipsparseCreateDnMat"
+            )
+        except TypeError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise RuntimeError(
+            f"hipsparseCreateDnMat wrapper signature mismatch: {last_error}"
+        ) from last_error
+    raise RuntimeError("hipsparseCreateDnMat wrapper signature mismatch")
+
+
+class _HipFloatComplex(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_float), ("y", ctypes.c_float)]
+
+
+class _HipDoubleComplex(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+
+def _hipsparse_value_type(value_dtype):
+    mapping = {
+        torch.float32: ("HIP_R_32F",),
+        torch.float64: ("HIP_R_64F",),
+        torch.complex64: ("HIP_C_32F", "HIP_C_32FC"),
+        torch.complex128: ("HIP_C_64F", "HIP_C_64FC"),
+    }
+    if value_dtype not in mapping:
+        raise RuntimeError(f"hipSPARSE CSR SpMV has no dtype mapping for {value_dtype}")
+    return _hip_lookup("hipDataType", mapping[value_dtype])
+
+
+def _hipsparse_scalar(value_dtype, real, imag=0.0):
+    if value_dtype == torch.float32:
+        return ctypes.c_float(float(real))
+    if value_dtype == torch.float64:
+        return ctypes.c_double(float(real))
+    if value_dtype == torch.complex64:
+        scalar_type = getattr(hip, "hipComplex", None) or getattr(
+            hip, "hipFloatComplex", None
+        )
+        if scalar_type is not None:
+            return scalar_type(float(real), float(imag))
+        return _HipFloatComplex(float(real), float(imag))
+    if value_dtype == torch.complex128:
+        scalar_type = getattr(hip, "hipDoubleComplex", None) or getattr(
+            hip, "hipComplexDouble", None
+        )
+        if scalar_type is not None:
+            return scalar_type(float(real), float(imag))
+        return _HipDoubleComplex(float(real), float(imag))
+    raise RuntimeError(f"hipSPARSE CSR SpMV does not support {value_dtype}")
+
+
+def _hipsparse_index_type(index_dtype, context):
+    mapping = {
+        torch.int32: ("HIPSPARSE_INDEX_32I",),
+        torch.int64: ("HIPSPARSE_INDEX_64I",),
+    }
+    if index_dtype not in mapping:
+        raise RuntimeError(
+            f"{context} has no supported index dtype mapping for {index_dtype}"
+        )
+    return _hipsparse_lookup("hipsparseIndexType_t", mapping[index_dtype])
+
+
+def _hipsparse_spmv_operation(op, context):
+    op_name = _normalize_spmv_reference_op(op)
+    mapping = {
+        "non": ("HIPSPARSE_OPERATION_NON_TRANSPOSE",),
+        "trans": ("HIPSPARSE_OPERATION_TRANSPOSE",),
+        "conj": ("HIPSPARSE_OPERATION_CONJUGATE_TRANSPOSE",),
+    }
+    if op_name not in mapping:
+        raise RuntimeError(f"{context} does not support op={op_name}")
+    return _hipsparse_lookup("hipsparseOperation_t", mapping[op_name])
+
+
+def _hipsparse_spmm_operation(op, context):
+    return _hipsparse_spmv_operation(op, context)
+
+
+def _hipsparse_spmv_csr_skip_reason(value_dtype, index_dtype, op="non"):
+    op_name = _normalize_spmv_reference_op(op)
+    if not _is_rocm_runtime():
+        return "hipSPARSE CSR SpMV reference requires a ROCm runtime"
+    unavailable_reason = _hipsparse_unavailable_reason()
+    if unavailable_reason is not None:
+        return unavailable_reason
+    required_symbols = (
+        "hipsparseCreate",
+        "hipsparseDestroy",
+        "hipsparseCreateCsr",
+        "hipsparseCreateDnVec",
+        "hipsparseDestroyDnVec",
+        "hipsparseDestroySpMat",
+        "hipsparseSpMV_bufferSize",
+        "hipsparseSpMV",
+    )
+    for symbol in required_symbols:
+        if not hasattr(hipsparse, symbol):
+            return f"hipSPARSE CSR SpMV direct API is unavailable: missing {symbol}"
+    if value_dtype not in (torch.float32, torch.float64, torch.complex64, torch.complex128):
+        return f"hipSPARSE CSR SpMV has no supported value dtype mapping for {value_dtype}"
+    if index_dtype not in (torch.int32, torch.int64):
+        return f"hipSPARSE CSR SpMV has no supported index dtype mapping for {index_dtype}"
+    try:
+        _ = _hipsparse_value_type(value_dtype)
+        _ = _hipsparse_scalar(value_dtype, 1.0, 0.0)
+        _ = _hipsparse_scalar(value_dtype, 0.0, 0.0)
+        _ = _hipsparse_index_type(index_dtype, "hipSPARSE CSR SpMV")
+        _ = _hipsparse_spmv_operation(op_name, "hipSPARSE CSR SpMV")
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+def _hipsparse_spmv_coo_direct_skip_reason(value_dtype, index_dtype, op="non"):
+    op_name = _normalize_sparse_reference_op(op)
+    if not _is_rocm_runtime():
+        return "hipSPARSE COO SpMV reference requires a ROCm runtime"
+    unavailable_reason = _hipsparse_unavailable_reason()
+    if unavailable_reason is not None:
+        return unavailable_reason
+    required_symbols = (
+        "hipsparseCreate",
+        "hipsparseDestroy",
+        "hipsparseCreateCoo",
+        "hipsparseCreateDnVec",
+        "hipsparseDestroyDnVec",
+        "hipsparseDestroySpMat",
+        "hipsparseSpMV_bufferSize",
+        "hipsparseSpMV",
+    )
+    for symbol in required_symbols:
+        if not hasattr(hipsparse, symbol):
+            return f"hipSPARSE COO SpMV direct API is unavailable: missing {symbol}"
+    if value_dtype not in (torch.float32, torch.float64, torch.complex64, torch.complex128):
+        return f"hipSPARSE COO SpMV has no supported value dtype mapping for {value_dtype}"
+    if index_dtype not in (torch.int32, torch.int64):
+        return f"hipSPARSE COO SpMV has no supported index dtype mapping for {index_dtype}"
+    try:
+        _ = _hipsparse_value_type(value_dtype)
+        _ = _hipsparse_scalar(value_dtype, 1.0, 0.0)
+        _ = _hipsparse_scalar(value_dtype, 0.0, 0.0)
+        _ = _hipsparse_index_type(index_dtype, "hipSPARSE COO SpMV")
+        _ = _hipsparse_spmv_operation(op_name, "hipSPARSE COO SpMV")
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+def _hipsparse_spmv_csc_skip_reason(value_dtype, index_dtype, op="non"):
+    """CSC SpMV rides the same generic API as CSR, with a CSC descriptor."""
+    reason = _hipsparse_spmv_csr_skip_reason(value_dtype, index_dtype, op=op)
+    if reason is not None:
+        return reason.replace("CSR SpMV", "CSC SpMV")
+    if not hasattr(hipsparse, "hipsparseCreateCsc"):
+        return "hipSPARSE CSC SpMV direct API is unavailable: missing hipsparseCreateCsc"
+    return None
+
+
+def _cupy_cusparse_spmv_skip_reason(value_dtype):
+    """Why the CuPy/cuSPARSE vendor baseline cannot serve this dtype."""
+    if _IS_MTHREADS_RUNTIME or _IS_ASCEND_RUNTIME:
+        # Neither runtime exposes CuPy; each has its own baseline (torch.sparse on
+        # MUSA, ops-sparse on Ascend), so the CuPy path is simply not applicable.
+        return (
+            f"CuPy/cuSPARSE is not applicable on the {_backend_name()} backend "
+            f"(baseline: {_vendor_sparse_library() or 'none'})"
+        )
+    if cp is None or cpx_sparse is None:
+        return "CuPy/cuSPARSE is not available"
+    if value_dtype not in _CUPY_SPMV_SUPPORTED_VALUE_DTYPES:
+        return f"{value_dtype} is not supported by the CuPy/cuSPARSE SpMV baseline"
+    return None
+
+
+def _spmv_csr_sparse_ref_backend(value_dtype, index_dtype, op="non"):
+    """Pick the vendor sparse library for a CSR SpMV reference, per backend.
+
+    Returns (backend, reason). ``backend`` is None when no vendor library can serve
+    the request, in which case ``reason`` explains why and callers fall back to the
+    portable torch.sparse path.
+    """
+    op_name = _normalize_spmv_reference_op(op)
+    vendor = _vendor_sparse_library()
+    if vendor == "hipsparse":
+        skip_reason = _hipsparse_spmv_csr_skip_reason(value_dtype, index_dtype, op=op_name)
+        if skip_reason is None:
+            return "hipsparse", None
+        return None, skip_reason
+    if vendor != "cupy_cusparse":
+        return (
+            None,
+            f"{_sparse_backend_label(vendor)} CSR SpMV baseline is not wired for this runner",
+        )
+    skip_reason = _cupy_cusparse_spmv_skip_reason(value_dtype)
+    if skip_reason is None:
+        return "cupy_cusparse", None
+    return None, skip_reason
+
+
+def _spmv_csc_sparse_ref_backend(value_dtype, index_dtype, op="non"):
+    """Pick the vendor sparse library for a CSC SpMV reference, per backend."""
+    op_name = _normalize_spmv_reference_op(op)
+    vendor = _vendor_sparse_library()
+    if vendor == "hipsparse":
+        skip_reason = _hipsparse_spmv_csc_skip_reason(
+            value_dtype, index_dtype, op=op_name
+        )
+        if skip_reason is None:
+            return "hipsparse", None
+        return None, skip_reason
+    if vendor != "cupy_cusparse":
+        return (
+            None,
+            f"{_sparse_backend_label(vendor)} CSC SpMV baseline is not wired for this runner",
+        )
+    skip_reason = _cupy_cusparse_spmv_skip_reason(value_dtype)
+    if skip_reason is None:
+        return "cupy_cusparse", None
+    return None, skip_reason
+
+
+def _spmv_csr_reference_backend(value_dtype, index_dtype, op="non"):
+    sparse_backend, reason = _spmv_csr_sparse_ref_backend(value_dtype, index_dtype, op=op)
+    if sparse_backend is not None:
+        return sparse_backend, None
+    return "torch", reason
+
+
+def _spmv_csr_ref_pytorch(
+    data,
+    indices,
+    indptr,
+    x,
+    shape,
+    out_dtype=None,
+    op="non",
+    return_compute=False,
+    reference_compute_dtype=False,
+):
+    out_dtype = data.dtype if out_dtype is None else out_dtype
+    if reference_compute_dtype:
+        compute_dtype = _spmv_reference_compute_dtype(out_dtype)
+    elif out_dtype in (torch.float16, torch.bfloat16):
+        compute_dtype = torch.float32
+    else:
+        compute_dtype = out_dtype
+    device = data.device
+    data_ref = data.to(compute_dtype)
+    x_ref = x.to(compute_dtype)
+    op_name = _normalize_spmv_reference_op(op)
+    if _IS_MACA_RUNTIME:
+        # MACA's fp32 CSR kernel is unstable with int64 indices; the helper picks
+        # int32 CSR or COO and retries non-finite output as COO.
+        y_ref, _ = _pytorch_sparse_mm(
+            data_ref, indices, indptr, shape, x_ref.unsqueeze(1), op=op_name
+        )
+    else:
+        try:
+            csr_ref = torch.sparse_csr_tensor(
+                indptr.to(torch.int64),
+                indices.to(torch.int64),
+                data_ref,
+                size=shape,
+                device=device,
+            )
+            y_ref = _apply_torch_sparse_spmv_op(csr_ref, x_ref.unsqueeze(1), op_name)
+        except Exception:
+            n_rows = int(shape[0])
+            row_ind = torch.repeat_interleave(
+                torch.arange(n_rows, device=device, dtype=torch.int64),
+                indptr.to(torch.int64)[1:] - indptr.to(torch.int64)[:-1],
+            )
+            coo_ref = torch.sparse_coo_tensor(
+                torch.stack([row_ind, indices.to(torch.int64)]),
+                data_ref,
+                shape,
+                device=device,
+            ).coalesce()
+            y_ref = _apply_torch_sparse_spmv_op(coo_ref, x_ref.unsqueeze(1), op_name)
+    if return_compute:
+        return y_ref
+    return _cast_spmv_reference_output(y_ref, out_dtype)
+
+
+def _spmv_csr_ref_cupy(
+    data,
+    indices,
+    indptr,
+    x,
+    shape,
+    out_dtype=None,
+    op="non",
+    reference_compute_dtype=False,
+):
+    _require_cupy()
+    out_dtype = data.dtype if out_dtype is None else out_dtype
+    compute_dtype = (
+        _spmv_reference_compute_dtype(out_dtype)
+        if reference_compute_dtype
+        else out_dtype
+    )
+    op_name = _normalize_spmv_reference_op(op)
+    data_ref = data.to(compute_dtype)
+    x_ref = x.to(compute_dtype)
+    data_cp = _cupy_from_torch(data_ref)
+    ind_cp = _cupy_from_torch(indices.to(torch.int64))
+    ptr_cp = _cupy_from_torch(indptr.to(torch.int64))
+    x_cp = _cupy_from_torch(x_ref)
+    matrix = cpx_sparse.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
+    y_ref = _apply_cupy_spmv_op(matrix, x_cp, op_name)
+    return _cast_spmv_reference_output(_torch_from_cupy(y_ref), out_dtype)
+
+
+def _spmv_coo_sparse_ref_backend(value_dtype, index_dtype, op="non"):
+    op_name = _normalize_sparse_reference_op(op)
+    vendor = _vendor_sparse_library()
+    if vendor == "hipsparse":
+        direct_reason = _hipsparse_spmv_coo_direct_skip_reason(
+            value_dtype, index_dtype, op=op_name
+        )
+        if direct_reason is None:
+            return "hipsparse", None
+        return None, direct_reason
+    if vendor != "cupy_cusparse":
+        return (
+            None,
+            f"{_sparse_backend_label(vendor)} COO SpMV baseline is not wired for this runner",
+        )
+    skip_reason = _cupy_cusparse_spmv_skip_reason(value_dtype)
+    if skip_reason is None:
+        return "cupy_cusparse", None
+    return None, skip_reason
+
+
+def _spmv_coo_reference_backend(value_dtype, index_dtype, op="non"):
+    sparse_backend, reason = _spmv_coo_sparse_ref_backend(value_dtype, index_dtype, op=op)
+    if sparse_backend is not None:
+        return sparse_backend, None
+    return "torch", reason
+
+
+def _spmv_coo_ref_pytorch(
+    data,
+    row,
+    col,
+    x,
+    shape,
+    out_dtype=None,
+    op="non",
+    return_compute=False,
+    reference_compute_dtype=False,
+):
+    out_dtype = data.dtype if out_dtype is None else out_dtype
+    if reference_compute_dtype:
+        compute_dtype = _sparse_reference_compute_dtype(out_dtype)
+    elif out_dtype in (torch.float16, torch.bfloat16):
+        compute_dtype = torch.float32
+    else:
+        compute_dtype = out_dtype
+    data_ref = data.to(compute_dtype)
+    x_ref = x.to(compute_dtype)
+    coo_ref = torch.sparse_coo_tensor(
+        torch.stack([row.to(torch.int64), col.to(torch.int64)]),
+        data_ref,
+        shape,
+        device=data.device,
+    ).coalesce()
+    y_ref = _apply_torch_sparse_matmul_op(coo_ref, x_ref, op)
+    if return_compute:
+        return y_ref
+    return _cast_sparse_reference_output(y_ref, out_dtype)
+
+
+def _spmv_coo_ref_cupy(
+    data,
+    row,
+    col,
+    x,
+    shape,
+    out_dtype=None,
+    op="non",
+    reference_compute_dtype=False,
+):
+    _require_cupy()
+    out_dtype = data.dtype if out_dtype is None else out_dtype
+    compute_dtype = (
+        _sparse_reference_compute_dtype(out_dtype)
+        if reference_compute_dtype
+        else out_dtype
+    )
+    data_ref = data.to(compute_dtype)
+    x_ref = x.to(compute_dtype)
+    data_cp = _cupy_from_torch(data_ref)
+    row_cp = _cupy_from_torch(row.to(torch.int64))
+    col_cp = _cupy_from_torch(col.to(torch.int64))
+    x_cp = _cupy_from_torch(x_ref)
+    matrix = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
+    y_ref = _apply_cupy_sparse_matmul_op(matrix, x_cp, op)
+    return _cast_sparse_reference_output(_torch_from_cupy(y_ref), out_dtype)
+
+
+def _prepare_spmv_coo_ref_hipsparse(
+    data,
+    row,
+    col,
+    x,
+    shape,
+    out=None,
+    op="non",
+):
+    op_name = _normalize_sparse_reference_op(op)
+    skip_reason = _hipsparse_spmv_coo_direct_skip_reason(
+        data.dtype, row.dtype, op=op_name
+    )
+    if skip_reason is not None:
+        raise RuntimeError(skip_reason)
+    if not all(torch.is_tensor(t) for t in (data, row, col, x)):
+        raise TypeError("data, row, col, x must all be torch.Tensor")
+    if not all(_is_accel_tensor(t) for t in (data, row, col, x)):
+        raise ValueError("data, row, col, x must all be CUDA tensors")
+    if not all(t.device == data.device for t in (row, col, x)):
+        raise ValueError("data, row, col, x must be on the same CUDA device")
+    if data.ndim != 1 or row.ndim != 1 or col.ndim != 1 or x.ndim != 1:
+        raise ValueError("data, row, col, x must all be 1D tensors")
+    if row.numel() != data.numel() or col.numel() != data.numel():
+        raise ValueError("data, row, col must have the same length")
+    if row.dtype != col.dtype:
+        raise ValueError(
+            "hipSPARSE COO SpMV direct reference requires row/col to share the same index dtype"
+        )
+
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    x_size = n_cols if op_name == "non" else n_rows
+    y_size = n_rows if op_name == "non" else n_cols
+    if x.numel() != x_size:
+        raise ValueError(f"x length must be {x_size} for op={op_name}")
+
+    data = data.contiguous()
+    row = row.contiguous()
+    col = col.contiguous()
+    x = x.contiguous()
+    value_type = _hipsparse_value_type(data.dtype)
+    alpha = _hipsparse_scalar(data.dtype, 1.0, 0.0)
+    beta = _hipsparse_scalar(data.dtype, 0.0, 0.0)
+    index_type = _hipsparse_index_type(row.dtype, "hipSPARSE COO SpMV")
+    op_enum = _hipsparse_spmv_operation(op_name, "hipSPARSE COO SpMV")
+
+    y = out
+    if y is None:
+        y = torch.zeros(y_size, dtype=data.dtype, device=data.device)
+    else:
+        if not torch.is_tensor(y):
+            raise TypeError("out must be a torch.Tensor")
+        if not _is_accel_tensor(y) or y.device != data.device:
+            raise ValueError("out must be a CUDA tensor on the same device as data")
+        if y.dtype != data.dtype or y.shape != (y_size,):
+            raise ValueError("out must match the result shape and dtype")
+        if not y.is_contiguous():
+            raise ValueError("out must be contiguous")
+        y.zero_()
+
+    if y_size == 0:
+        return {
+            "backend": "hipsparse",
+            "buffer_size": 0,
+            "format": "coo",
+            "y": y,
+            "empty": True,
+        }
+
+    handle = None
+    spmat = None
+    vecx = None
+    vecy = None
+    workspace = 0
+    workspace_allocated = False
+    try:
+        handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
+        ptr_type = type(handle)
+
+        spmat = ptr_type()
+        vecx = ptr_type()
+        vecy = ptr_type()
+        spmat_ref = spmat.createRef()
+        vecx_ref = vecx.createRef()
+        vecy_ref = vecy.createRef()
+
+        row_ptr = HipPointer.fromObj(row.data_ptr())
+        col_ptr = HipPointer.fromObj(col.data_ptr())
+        values_ptr = HipPointer.fromObj(data.data_ptr())
+        x_ptr = HipPointer.fromObj(x.data_ptr())
+        y_ptr = HipPointer.fromObj(y.data_ptr())
+
+        index_base = _hipsparse_lookup(
+            "hipsparseIndexBase_t", ("HIPSPARSE_INDEX_BASE_ZERO",)
+        )
+        alg = _hipsparse_lookup(
+            "hipsparseSpMVAlg_t",
+            ("HIPSPARSE_SPMV_ALG_DEFAULT", "HIPSPARSE_MV_ALG_DEFAULT"),
+        )
+
+        _hipsparse_create_coo_descriptor(
+            spmat_ref,
+            n_rows,
+            n_cols,
+            int(data.numel()),
+            row_ptr,
+            col_ptr,
+            values_ptr,
+            index_type,
+            index_base,
+            value_type,
+        )
+        _hip_check_result(
+            hipsparse.hipsparseCreateDnVec(vecx_ref, x_size, x_ptr, value_type),
+            "hipsparseCreateDnVec(x)",
+        )
+        _hip_check_result(
+            hipsparse.hipsparseCreateDnVec(vecy_ref, y_size, y_ptr, value_type),
+            "hipsparseCreateDnVec(y)",
+        )
+
+        size_out = ctypes.c_size_t()
+        _hip_check_result(
+            hipsparse.hipsparseSpMV_bufferSize(
+                handle,
+                op_enum,
+                alpha,
+                spmat,
+                vecx,
+                beta,
+                vecy,
+                value_type,
+                alg,
+                size_out,
+            ),
+            "hipsparseSpMV_bufferSize",
+        )
+        buffer_size = int(size_out.value)
+        if buffer_size > 0:
+            workspace = _hip_check_result(hip.hipMalloc(buffer_size), "hipMalloc")
+            workspace_allocated = True
+        else:
+            workspace = 0
+        return {
+            "backend": "hipsparse",
+            "buffer_size": buffer_size,
+            "format": "coo",
+            "handle": handle,
+            "spmat": spmat,
+            "vecx": vecx,
+            "vecy": vecy,
+            "workspace": workspace,
+            "workspace_allocated": workspace_allocated,
+            "op_enum": op_enum,
+            "alpha": alpha,
+            "beta": beta,
+            "value_type": value_type,
+            "alg": alg,
+            "y": y,
+            "empty": False,
+        }
+    finally:
+        if handle is None and vecy is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroyDnVec(vecy), "hipsparseDestroyDnVec(y)"
+                )
+            except Exception:
+                pass
+        if handle is None and vecx is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroyDnVec(vecx), "hipsparseDestroyDnVec(x)"
+                )
+            except Exception:
+                pass
+        if handle is None and spmat is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroySpMat(spmat), "hipsparseDestroySpMat"
+                )
+            except Exception:
+                pass
+        if handle is None and workspace_allocated:
+            try:
+                _hip_check_result(hip.hipFree(workspace), "hipFree")
+            except Exception:
+                pass
+
+
+def _run_spmv_coo_ref_hipsparse_prepared(state):
+    if state.get("empty"):
+        return state["y"]
+    _hip_check_result(
+        hipsparse.hipsparseSpMV(
+            state["handle"],
+            state["op_enum"],
+            state["alpha"],
+            state["spmat"],
+            state["vecx"],
+            state["beta"],
+            state["vecy"],
+            state["value_type"],
+            state["alg"],
+            state["workspace"],
+        ),
+        "hipsparseSpMV",
+    )
+    return state["y"]
+
+
+def _destroy_spmv_coo_ref_hipsparse_prepared(state):
+    vecy = state.get("vecy")
+    vecx = state.get("vecx")
+    spmat = state.get("spmat")
+    workspace_allocated = bool(state.get("workspace_allocated"))
+    workspace = state.get("workspace", 0)
+    handle = state.get("handle")
+    if vecy is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyDnVec(vecy), "hipsparseDestroyDnVec(y)"
+            )
+        except Exception:
+            pass
+    if vecx is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyDnVec(vecx), "hipsparseDestroyDnVec(x)"
+            )
+        except Exception:
+            pass
+    if spmat is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroySpMat(spmat), "hipsparseDestroySpMat"
+            )
+        except Exception:
+            pass
+    if workspace_allocated:
+        try:
+            _hip_check_result(hip.hipFree(workspace), "hipFree")
+        except Exception:
+            pass
+    if handle is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+        except Exception:
+            pass
+
+
+def spmv_coo_ref_hipsparse(
+    data,
+    row,
+    col,
+    x,
+    shape,
+    out=None,
+    op="non",
+    return_metadata=False,
+):
+    state = _prepare_spmv_coo_ref_hipsparse(
+        data,
+        row,
+        col,
+        x,
+        shape,
+        out=out,
+        op=op,
+    )
+    try:
+        y = _run_spmv_coo_ref_hipsparse_prepared(state)
+        metadata = {
+            "backend": "hipsparse",
+            "buffer_size": int(state.get("buffer_size", 0)),
+            "format": "coo",
+        }
+        if return_metadata:
+            return y, metadata
+        return y
+    finally:
+        _destroy_spmv_coo_ref_hipsparse_prepared(state)
+
+
+def _prepare_spmv_csr_ref_hipsparse(
+    data,
+    indices,
+    indptr,
+    x,
+    shape,
+    out=None,
+    op="non",
+):
+    return _prepare_spmv_ref_hipsparse(
+        data, indices, indptr, x, shape, out=out, op=op, layout="csr"
+    )
+
+
+def _prepare_spmv_csc_ref_hipsparse(
+    data,
+    indices,
+    indptr,
+    x,
+    shape,
+    out=None,
+    op="non",
+):
+    return _prepare_spmv_ref_hipsparse(
+        data, indices, indptr, x, shape, out=out, op=op, layout="csc"
+    )
+
+
+def _prepare_spmv_ref_hipsparse(
+    data,
+    indices,
+    indptr,
+    x,
+    shape,
+    out=None,
+    op="non",
+    layout="csr",
+):
+    """Shared hipSPARSE generic-API SpMV setup for CSR and CSC.
+
+    The two formats differ only in the descriptor constructor and in which
+    dimension ``indptr`` indexes; the SpMV call, the dense vectors and the
+    workspace are identical, so they are not worth duplicating.
+    """
+
+    if layout not in ("csr", "csc"):
+        raise ValueError(f"layout must be 'csr' or 'csc', got {layout!r}")
+    fmt = layout.upper()
+    op_name = _normalize_spmv_reference_op(op)
+    skip_fn = (
+        _hipsparse_spmv_csr_skip_reason
+        if layout == "csr"
+        else _hipsparse_spmv_csc_skip_reason
+    )
+    skip_reason = skip_fn(data.dtype, indices.dtype, op=op_name)
+    if skip_reason is not None:
+        raise RuntimeError(skip_reason)
+    if not all(torch.is_tensor(t) for t in (data, indices, indptr, x)):
+        raise TypeError("data, indices, indptr, x must all be torch.Tensor")
+    if not all(_is_accel_tensor(t) for t in (data, indices, indptr, x)):
+        raise ValueError("data, indices, indptr, x must all be CUDA tensors")
+    if not all(t.device == data.device for t in (indices, indptr, x)):
+        raise ValueError("data, indices, indptr, x must be on the same CUDA device")
+
+    if data.ndim != 1 or indices.ndim != 1 or indptr.ndim != 1 or x.ndim != 1:
+        raise ValueError("data, indices, indptr, x must all be 1D tensors")
+    if indices.numel() != data.numel():
+        raise ValueError("data and indices must have the same length")
+    n_rows, n_cols = int(shape[0]), int(shape[1])
+    # CSC indexes columns, CSR indexes rows; the maths shape is the same either way.
+    n_slots = n_rows if layout == "csr" else n_cols
+    slot_name = "n_rows" if layout == "csr" else "n_cols"
+    if indptr.numel() != n_slots + 1:
+        raise ValueError(f"indptr length must be {slot_name}+1={n_slots + 1}")
+    x_size = n_cols if op_name == "non" else n_rows
+    y_size = n_rows if op_name == "non" else n_cols
+    if x.numel() != x_size:
+        raise ValueError(f"x length must be {x_size} for op={op_name}")
+
+    data = data.contiguous()
+    indices = indices.contiguous()
+    indptr = indptr.contiguous()
+    x = x.contiguous()
+    value_type = _hipsparse_value_type(data.dtype)
+    alpha = _hipsparse_scalar(data.dtype, 1.0, 0.0)
+    beta = _hipsparse_scalar(data.dtype, 0.0, 0.0)
+    offsets_index_type = _hipsparse_index_type(
+        indptr.dtype, f"hipSPARSE {fmt} SpMV offsets"
+    )
+    entries_index_type = _hipsparse_index_type(
+        indices.dtype, f"hipSPARSE {fmt} SpMV entry indices"
+    )
+    op_enum = _hipsparse_spmv_operation(op_name, f"hipSPARSE {fmt} SpMV")
+
+    y = out
+    if y is None:
+        y = torch.zeros(y_size, dtype=data.dtype, device=data.device)
+    else:
+        if not torch.is_tensor(y):
+            raise TypeError("out must be a torch.Tensor")
+        if not _is_accel_tensor(y) or y.device != data.device:
+            raise ValueError("out must be a CUDA tensor on the same device as data")
+        if y.dtype != data.dtype or y.shape != (y_size,):
+            raise ValueError("out must match the result shape and dtype")
+        if not y.is_contiguous():
+            raise ValueError("out must be contiguous")
+        y.zero_()
+
+    if y_size == 0:
+        return {
+            "backend": "hipsparse",
+            "buffer_size": 0,
+            "y": y,
+            "empty": True,
+        }
+
+    handle = None
+    spmat = None
+    vecx = None
+    vecy = None
+    workspace = 0
+    workspace_allocated = False
+    try:
+        handle = _hip_check_result(hipsparse.hipsparseCreate(), "hipsparseCreate")
+        ptr_type = type(handle)
+
+        # hip-python descriptor outputs must be created via createRef().
+        spmat = ptr_type()
+        vecx = ptr_type()
+        vecy = ptr_type()
+        spmat_ref = spmat.createRef()
+        vecx_ref = vecx.createRef()
+        vecy_ref = vecy.createRef()
+
+        # Pointers must wrap tensor.data_ptr(), not the tensor object itself.
+        offsets_ptr = HipPointer.fromObj(indptr.data_ptr())
+        entries_ptr = HipPointer.fromObj(indices.data_ptr())
+        values_ptr = HipPointer.fromObj(data.data_ptr())
+        x_ptr = HipPointer.fromObj(x.data_ptr())
+        y_ptr = HipPointer.fromObj(y.data_ptr())
+
+        index_base = _hipsparse_lookup(
+            "hipsparseIndexBase_t", ("HIPSPARSE_INDEX_BASE_ZERO",)
+        )
+        alg = _hipsparse_lookup(
+            "hipsparseSpMVAlg_t",
+            ("HIPSPARSE_SPMV_ALG_DEFAULT", "HIPSPARSE_MV_ALG_DEFAULT"),
+        )
+
+        make_descriptor = (
+            _hipsparse_create_csr_descriptor
+            if layout == "csr"
+            else _hipsparse_create_csc_descriptor
+        )
+        make_descriptor(
+            spmat_ref,
+            n_rows,
+            n_cols,
+            int(data.numel()),
+            offsets_ptr,
+            entries_ptr,
+            values_ptr,
+            offsets_index_type,
+            entries_index_type,
+            index_base,
+            value_type,
+        )
+        _hip_check_result(
+            hipsparse.hipsparseCreateDnVec(vecx_ref, x_size, x_ptr, value_type),
+            "hipsparseCreateDnVec(x)",
+        )
+        _hip_check_result(
+            hipsparse.hipsparseCreateDnVec(vecy_ref, y_size, y_ptr, value_type),
+            "hipsparseCreateDnVec(y)",
+        )
+
+        # alpha/beta must be passed directly, not via ctypes.byref(...).
+        # Current hip-python exposes hipsparseSpMV_bufferSize with an explicit
+        # c_size_t output slot instead of returning the size as a payload.
+        size_out = ctypes.c_size_t()
+        _hip_check_result(
+            hipsparse.hipsparseSpMV_bufferSize(
+                handle,
+                op_enum,
+                alpha,
+                spmat,
+                vecx,
+                beta,
+                vecy,
+                value_type,
+                alg,
+                size_out,
+            ),
+            "hipsparseSpMV_bufferSize",
+        )
+        buffer_size = int(size_out.value)
+        if buffer_size > 0:
+            workspace = _hip_check_result(
+                hip.hipMalloc(buffer_size), "hipMalloc"
+            )
+            workspace_allocated = True
+        else:
+            # hipSPARSE may legitimately report buffer_size == 0 for small inputs.
+            workspace = 0
+        return {
+            "backend": "hipsparse",
+            "buffer_size": buffer_size,
+            "handle": handle,
+            "spmat": spmat,
+            "vecx": vecx,
+            "vecy": vecy,
+            "workspace": workspace,
+            "workspace_allocated": workspace_allocated,
+            "op_enum": op_enum,
+            "alpha": alpha,
+            "beta": beta,
+            "value_type": value_type,
+            "alg": alg,
+            "y": y,
+            "empty": False,
+        }
+    finally:
+        if handle is None and vecy is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroyDnVec(vecy), "hipsparseDestroyDnVec(y)"
+                )
+            except Exception:
+                pass
+        if handle is None and vecx is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroyDnVec(vecx), "hipsparseDestroyDnVec(x)"
+                )
+            except Exception:
+                pass
+        if handle is None and spmat is not None:
+            try:
+                _hip_check_result(
+                    hipsparse.hipsparseDestroySpMat(spmat), "hipsparseDestroySpMat"
+                )
+            except Exception:
+                pass
+        if handle is None and workspace_allocated:
+            try:
+                _hip_check_result(hip.hipFree(workspace), "hipFree")
+            except Exception:
+                pass
+
+
+def _run_spmv_csr_ref_hipsparse_prepared(state):
+    if state.get("empty"):
+        return state["y"]
+    _hip_check_result(
+        hipsparse.hipsparseSpMV(
+            state["handle"],
+            state["op_enum"],
+            state["alpha"],
+            state["spmat"],
+            state["vecx"],
+            state["beta"],
+            state["vecy"],
+            state["value_type"],
+            state["alg"],
+            state["workspace"],
+        ),
+        "hipsparseSpMV",
+    )
+    return state["y"]
+
+
+def _destroy_spmv_csr_ref_hipsparse_prepared(state):
+    vecy = state.get("vecy")
+    vecx = state.get("vecx")
+    spmat = state.get("spmat")
+    workspace_allocated = bool(state.get("workspace_allocated"))
+    workspace = state.get("workspace", 0)
+    handle = state.get("handle")
+    if vecy is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyDnVec(vecy), "hipsparseDestroyDnVec(y)"
+            )
+        except Exception:
+            pass
+    if vecx is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroyDnVec(vecx), "hipsparseDestroyDnVec(x)"
+            )
+        except Exception:
+            pass
+    if spmat is not None:
+        try:
+            _hip_check_result(
+                hipsparse.hipsparseDestroySpMat(spmat), "hipsparseDestroySpMat"
+            )
+        except Exception:
+            pass
+    if workspace_allocated:
+        try:
+            _hip_check_result(hip.hipFree(workspace), "hipFree")
+        except Exception:
+            pass
+    if handle is not None:
+        try:
+            _hip_check_result(hipsparse.hipsparseDestroy(handle), "hipsparseDestroy")
+        except Exception:
+            pass
+
+
+def spmv_csr_ref_hipsparse(
+    data,
+    indices,
+    indptr,
+    x,
+    shape,
+    out=None,
+    op="non",
+    return_metadata=False,
+):
+    state = _prepare_spmv_csr_ref_hipsparse(
+        data,
+        indices,
+        indptr,
+        x,
+        shape,
+        out=out,
+        op=op,
+    )
+    try:
+        y = _run_spmv_csr_ref_hipsparse_prepared(state)
+        metadata = {"backend": "hipsparse", "buffer_size": int(state.get("buffer_size", 0))}
+        if return_metadata:
+            return y, metadata
+        return y
+    finally:
+        _destroy_spmv_csr_ref_hipsparse_prepared(state)
+
+
+def _spmv_csr_reference(
+    data,
+    indices,
+    indptr,
+    x,
+    shape,
+    out_dtype=None,
+    op="non",
+    reference_compute_dtype=False,
+    return_metadata=False,
+):
+    out_dtype = data.dtype if out_dtype is None else out_dtype
+    op_name = _normalize_spmv_reference_op(op)
+    backend, fallback_reason = _spmv_csr_reference_backend(
+        data.dtype, indices.dtype, op=op_name
+    )
+    if backend == "hipsparse":
+        result = spmv_csr_ref_hipsparse(
+            data,
+            indices,
+            indptr,
+            x,
+            shape,
+            op=op_name,
+        )
+    elif backend == "cupy_cusparse":
+        result = _spmv_csr_ref_cupy(
+            data,
+            indices,
+            indptr,
+            x,
+            shape,
+            out_dtype=out_dtype,
+            op=op_name,
+            reference_compute_dtype=reference_compute_dtype,
+        )
+    else:
+        result = _spmv_csr_ref_pytorch(
+            data,
+            indices,
+            indptr,
+            x,
+            shape,
+            out_dtype=out_dtype,
+            op=op_name,
+            reference_compute_dtype=reference_compute_dtype,
+        )
+    metadata = {"backend": backend, "fallback_reason": fallback_reason}
+    if return_metadata:
+        return result, metadata
+    return result
+
+
+# The prepared state is format-agnostic, so CSC reuses the CSR run/destroy pair.
+_run_spmv_csc_ref_hipsparse_prepared = _run_spmv_csr_ref_hipsparse_prepared
+_destroy_spmv_csc_ref_hipsparse_prepared = _destroy_spmv_csr_ref_hipsparse_prepared
+
+
+def _benchmark_spmv_csc_sparse_ref(
+    data,
+    indices,
+    indptr,
+    x,
+    shape,
+    warmup,
+    iters,
+    op="non",
+):
+    """Vendor CSC SpMV baseline: hipSPARSE on ROCm, CuPy/cuSPARSE on CUDA."""
+    op_name = _normalize_spmv_reference_op(op)
+    backend, reason = _spmv_csc_sparse_ref_backend(
+        data.dtype, indices.dtype, op=op_name
+    )
+    result = {"backend": backend, "values": None, "ms": None, "reason": reason}
+    if backend is None:
+        return result
+    if backend == "hipsparse":
+        values, ms = _benchmark_prepared_cuda_op(
+            lambda: _prepare_spmv_csc_ref_hipsparse(
+                data, indices, indptr, x, shape, op=op_name
+            ),
+            _run_spmv_csc_ref_hipsparse_prepared,
+            _destroy_spmv_csc_ref_hipsparse_prepared,
+            warmup=warmup,
+            iters=iters,
+        )
+        result["values"] = values
+        result["ms"] = ms
+        result["reason"] = None
+        return result
+
+    data_cp = _cupy_from_torch(data)
+    ind_cp = _cupy_from_torch(indices.to(torch.int64))
+    ptr_cp = _cupy_from_torch(indptr.to(torch.int64))
+    x_cp = _cupy_from_torch(x)
+    matrix = cpx_sparse.csc_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
+    values_cp, ms = _benchmark_cuda_op(
+        lambda: _apply_cupy_spmv_op(matrix, x_cp, op_name),
+        warmup=warmup,
+        iters=iters,
+    )
+    result["values"] = _torch_from_cupy(values_cp)
+    result["ms"] = ms
+    result["reason"] = None
+    return result
+
+
+def _benchmark_spmv_csr_sparse_ref(
+    data,
+    indices,
+    indptr,
+    x,
+    shape,
+    warmup,
+    iters,
+    op="non",
+    include_csc=False,
+):
+    op_name = _normalize_spmv_reference_op(op)
+    backend, reason = _spmv_csr_sparse_ref_backend(data.dtype, indices.dtype, op=op_name)
+    result = {
+        "backend": backend,
+        "values": None,
+        "ms": None,
+        "csc_ms": None,
+        "reason": reason,
+    }
+    if backend is None:
+        return result
+    if backend == "hipsparse":
+        values, ms = _benchmark_prepared_cuda_op(
+            lambda: _prepare_spmv_csr_ref_hipsparse(
+                data, indices, indptr, x, shape, op=op_name
+            ),
+            _run_spmv_csr_ref_hipsparse_prepared,
+            _destroy_spmv_csr_ref_hipsparse_prepared,
+            warmup=warmup,
+            iters=iters,
+        )
+        result["values"] = values
+        result["ms"] = ms
+        result["reason"] = None
+        return result
+
+    data_cp = _cupy_from_torch(data)
+    ind_cp = _cupy_from_torch(indices.to(torch.int64))
+    ptr_cp = _cupy_from_torch(indptr.to(torch.int64))
+    x_cp = _cupy_from_torch(x)
+    matrix = cpx_sparse.csr_matrix((data_cp, ind_cp, ptr_cp), shape=shape)
+    values_cp, ms = _benchmark_cuda_op(
+        lambda: _apply_cupy_spmv_op(matrix, x_cp, op_name),
+        warmup=warmup,
+        iters=iters,
+    )
+    result["values"] = _torch_from_cupy(values_cp)
+    result["ms"] = ms
+    result["reason"] = None
+    if include_csc:
+        matrix_csc = matrix.tocsc()
+        values_csc, csc_ms = _benchmark_cuda_op(
+            lambda: _apply_cupy_spmv_op(matrix_csc, x_cp, op_name),
+            warmup=warmup,
+            iters=iters,
+        )
+        _ = values_csc
+        result["csc_ms"] = csc_ms
+    return result
+
+
+def _spmv_coo_reference(
+    data,
+    row,
+    col,
+    x,
+    shape,
+    out_dtype=None,
+    op="non",
+    reference_compute_dtype=False,
+    return_metadata=False,
+):
+    out_dtype = data.dtype if out_dtype is None else out_dtype
+    op_name = _normalize_sparse_reference_op(op)
+    backend, fallback_reason = _spmv_coo_reference_backend(
+        data.dtype, row.dtype, op=op_name
+    )
+    if backend == "hipsparse":
+        result = spmv_coo_ref_hipsparse(
+            data,
+            row,
+            col,
+            x,
+            shape,
+            op=op_name,
+        )
+    elif backend == "cupy_cusparse":
+        result = _spmv_coo_ref_cupy(
+            data,
+            row,
+            col,
+            x,
+            shape,
+            out_dtype=out_dtype,
+            op=op_name,
+            reference_compute_dtype=reference_compute_dtype,
+        )
+    else:
+        result = _spmv_coo_ref_pytorch(
+            data,
+            row,
+            col,
+            x,
+            shape,
+            out_dtype=out_dtype,
+            op=op_name,
+            reference_compute_dtype=reference_compute_dtype,
+        )
+    metadata = {"backend": backend, "fallback_reason": fallback_reason}
+    if return_metadata:
+        return result, metadata
+    return result
+
+
+def _benchmark_spmv_coo_sparse_ref(
+    data,
+    row,
+    col,
+    x,
+    shape,
+    warmup,
+    iters,
+    op="non",
+):
+    op_name = _normalize_sparse_reference_op(op)
+    backend, reason = _spmv_coo_sparse_ref_backend(data.dtype, row.dtype, op=op_name)
+    result = {
+        "backend": backend,
+        "values": None,
+        "ms": None,
+        "reason": reason,
+    }
+    if backend is None:
+        return result
+    if backend == "hipsparse":
+        values, ms = _benchmark_prepared_cuda_op(
+            lambda: _prepare_spmv_coo_ref_hipsparse(
+                data, row, col, x, shape, op=op_name
+            ),
+            _run_spmv_coo_ref_hipsparse_prepared,
+            _destroy_spmv_coo_ref_hipsparse_prepared,
+            warmup=warmup,
+            iters=iters,
+        )
+        result["values"] = values
+        result["ms"] = ms
+        result["reason"] = None
+        return result
+
+    data_cp = _cupy_from_torch(data)
+    row_cp = _cupy_from_torch(row.to(torch.int64))
+    col_cp = _cupy_from_torch(col.to(torch.int64))
+    x_cp = _cupy_from_torch(x)
+    matrix = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
+    # cupy has no native COO matvec: cupyx.scipy.sparse._base.__matmul__ delegates to
+    # __mul__, which is ``self.tocsr().__mul__(other)``, and coo_matrix does not
+    # override it.  Timing ``coo_matrix @ x`` therefore charges cuSPARSE a full
+    # COO->CSR sort+scan on *every* iteration, which is what made this column read
+    # ~75x slower than the kernel it is meant to represent.  Hoist the conversion out
+    # so the timed window holds only the SpMV kernel, matching how every other
+    # operator's vendor baseline is measured.
+    matrix_csr = matrix.tocsr()
+    values_cp, ms = _benchmark_cuda_op(
+        lambda: _apply_cupy_sparse_matmul_op(matrix_csr, x_cp, op_name),
+        warmup=warmup,
+        iters=iters,
+    )
+    result["values"] = _torch_from_cupy(values_cp)
+    result["ms"] = ms
+    result["reason"] = None
+    return result
+
+
+def _build_random_dense(dense_size, value_dtype, device):
+    if value_dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        return torch.randn(dense_size, dtype=value_dtype, device=device)
+    if _is_complex_dtype(value_dtype):
+        component_dtype = _component_dtype_for_complex(value_dtype)
+        real = torch.randn(dense_size, dtype=component_dtype, device=device)
+        imag = torch.randn(dense_size, dtype=component_dtype, device=device)
+        return torch.complex(real, imag)
+    raise TypeError(f"Unsupported value dtype: {value_dtype}")
+
+
+def _build_indices(nnz, dense_size, index_dtype, device, unique=False):
+    if unique and nnz <= dense_size:
+        return torch.randperm(dense_size, device=device)[:nnz].to(index_dtype)
+    return torch.randint(0, dense_size, (nnz,), dtype=index_dtype, device=device)
+
+
+def _build_random_csr(n_rows, n_cols, nnz, value_dtype, index_dtype, device):
+    if nnz <= 0 or n_rows <= 0 or n_cols <= 0:
+        indptr = torch.zeros(n_rows + 1, dtype=torch.int64, device=device)
+        return (
+            torch.empty(0, dtype=value_dtype, device=device),
+            torch.empty(0, dtype=index_dtype, device=device),
+            indptr,
+        )
+    row_choices = torch.randint(0, n_rows, (nnz,), device=device)
+    row_choices, _ = torch.sort(row_choices)
+    nnz_per_row = torch.bincount(row_choices, minlength=n_rows)
+    indptr = torch.zeros(n_rows + 1, dtype=torch.int64, device=device)
+    indptr[1:] = torch.cumsum(nnz_per_row, dim=0)
+    indices = torch.randint(0, n_cols, (nnz,), dtype=index_dtype, device=device)
+    data = _build_random_dense(nnz, value_dtype, device)
+    return data, indices, indptr
+
+
+def _validate_common_inputs(dense_vector, indices):
+    if dense_vector.ndim != 1:
+        raise ValueError("dense_vector must be a 1D tensor")
+    if indices.ndim != 1:
+        raise ValueError("indices must be a 1D tensor")
+    if not _is_accel_tensor(dense_vector) or not _is_accel_tensor(indices):
+        raise ValueError("dense_vector and indices must both be CUDA tensors")
+    if dense_vector.dtype not in SUPPORTED_VALUE_DTYPES:
+        raise TypeError(
+            f"dense_vector dtype must be one of: {', '.join(str(dt) for dt in SUPPORTED_VALUE_DTYPES)}"
+        )
+    if indices.dtype not in SUPPORTED_INDEX_DTYPES:
+        raise TypeError("indices dtype must be torch.int32 or torch.int64")
+
+
+def _prepare_inputs(dense_vector, indices):
+    _validate_common_inputs(dense_vector, indices)
+
+    dense_vector = dense_vector.contiguous()
+    indices = indices.contiguous()
+
+    max_index = -1
+    if indices.numel() > 0:
+        if torch.any(indices < 0).item():
+            raise IndexError("indices must be non-negative")
+        max_index = int(indices.max().item())
+        if max_index >= dense_vector.numel():
+            raise IndexError(
+                f"indices out of range: max index {max_index}, dense size {dense_vector.numel()}"
+            )
+
+    kernel_indices = indices
+    if indices.dtype == torch.int64:
+        if max_index > _INDEX_LIMIT_INT32:
+            raise ValueError(
+                f"int64 index value {max_index} exceeds Triton int32 kernel range"
+            )
+        kernel_indices = indices.to(torch.int32)
+
+    return dense_vector, indices, kernel_indices
+
+
+def _prepare_scatter_inputs(
+    sparse_values,
+    indices,
+    dense_size=None,
+    out=None,
+    dtype_policy="auto",
+    return_metadata=False,
+):
+    if sparse_values.ndim != 1:
+        raise ValueError("sparse_values must be a 1D tensor")
+    if indices.ndim != 1:
+        raise ValueError("indices must be a 1D tensor")
+    if sparse_values.numel() != indices.numel():
+        raise ValueError(
+            "sparse_values and indices must have the same number of elements"
+        )
+    if not _is_accel_tensor(sparse_values) or not _is_accel_tensor(indices):
+        raise ValueError("sparse_values and indices must both be CUDA tensors")
+    if sparse_values.dtype not in SUPPORTED_VALUE_DTYPES:
+        raise TypeError(
+            f"sparse_values dtype must be one of: {', '.join(str(dt) for dt in SUPPORTED_VALUE_DTYPES)}"
+        )
+    if indices.dtype not in SUPPORTED_INDEX_DTYPES:
+        raise TypeError("indices dtype must be torch.int32 or torch.int64")
+
+    requested_value_dtype = sparse_values.dtype
+    effective_value_dtype, fallback_applied, fallback_reason = (
+        _resolve_scatter_value_dtype(requested_value_dtype, dtype_policy=dtype_policy)
+    )
+    if effective_value_dtype != sparse_values.dtype:
+        sparse_values = sparse_values.to(effective_value_dtype)
+
+    sparse_values = sparse_values.contiguous()
+    indices = indices.contiguous()
+
+    if dense_size is None:
+        dense_size = int(indices.max().item()) + 1 if indices.numel() > 0 else 0
+    dense_size = int(dense_size)
+    if dense_size < 0:
+        raise ValueError("dense_size must be non-negative")
+
+    max_index = -1
+    if indices.numel() > 0:
+        if torch.any(indices < 0).item():
+            raise IndexError("indices must be non-negative")
+        max_index = int(indices.max().item())
+        if max_index >= dense_size:
+            raise IndexError(
+                f"indices out of range: max index {max_index}, dense size {dense_size}"
+            )
+
+    kernel_indices = indices
+
+    if out is not None:
+        if out.ndim != 1:
+            raise ValueError("out must be a 1D tensor")
+        if not _is_accel_tensor(out):
+            raise ValueError("out must be a CUDA tensor")
+        if out.dtype != sparse_values.dtype:
+            raise TypeError("out dtype must match sparse_values dtype")
+        if out.numel() != dense_size:
+            raise ValueError("out size must equal dense_size")
+        if out.device != sparse_values.device:
+            raise ValueError("out must be on the same device as sparse_values")
+
+    metadata = {
+        "requested_value_dtype": requested_value_dtype,
+        "effective_value_dtype": sparse_values.dtype,
+        "fallback_applied": bool(fallback_applied),
+        "fallback_reason": fallback_reason,
+        "dtype_policy": str(dtype_policy).lower(),
+    }
+    if return_metadata:
+        return sparse_values, indices, kernel_indices, dense_size, metadata
+    return sparse_values, indices, kernel_indices, dense_size
+
+
+def _benchmark_cuda_op(op, warmup, iters):
+    warmup = max(0, int(warmup))
+    iters = max(1, int(iters))
+
+    output = None
+    for _ in range(warmup):
+        output = op()
+
+    _ACCEL.synchronize()
+    if cp is not None:
+        cp.cuda.runtime.deviceSynchronize()
+    start_time = time.perf_counter()
+    for _ in range(iters):
+        output = op()
+    _ACCEL.synchronize()
+    if cp is not None:
+        cp.cuda.runtime.deviceSynchronize()
+    elapsed_ms = (time.perf_counter() - start_time) * 1000.0 / iters
+    return output, elapsed_ms
+
+
+def _benchmark_prepared_cuda_op(prepare_fn, run_fn, destroy_fn, warmup, iters):
+    warmup = max(0, int(warmup))
+    iters = max(1, int(iters))
+    state = None
+    start_ev = None
+    stop_ev = None
+    try:
+        state = prepare_fn()
+        output = None
+        for _ in range(warmup):
+            output = run_fn(state)
+
+        if _is_rocm_runtime() and _hip_runtime_event_available():
+            _ACCEL.synchronize()
+            start_ev = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(start)")
+            stop_ev = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(stop)")
+            _hip_check_result(hip.hipEventRecord(start_ev, 0), "hipEventRecord(start)")
+            for _ in range(iters):
+                output = run_fn(state)
+            _hip_check_result(hip.hipEventRecord(stop_ev, 0), "hipEventRecord(stop)")
+            _hip_check_result(
+                hip.hipEventSynchronize(stop_ev), "hipEventSynchronize(stop)"
+            )
+            return output, _hip_event_elapsed_ms(start_ev, stop_ev) / iters
+
+        _ACCEL.synchronize()
+        start_ev_torch = _ACCEL.Event(enable_timing=True)
+        end_ev_torch = _ACCEL.Event(enable_timing=True)
+        start_ev_torch.record()
+        for _ in range(iters):
+            output = run_fn(state)
+        end_ev_torch.record()
+        _ACCEL.synchronize()
+        return output, start_ev_torch.elapsed_time(end_ev_torch) / iters
+    finally:
+        _destroy_hip_event(stop_ev)
+        _destroy_hip_event(start_ev)
+        if state is not None:
+            destroy_fn(state)
+
+
+def _benchmark_prepared_hip_event_op(
+    prepare_fn, run_fn, destroy_fn, warmup, iters, event_stream="current"
+):
+    if not _is_rocm_runtime() or not _hip_runtime_event_available():
+        return _benchmark_prepared_cuda_op(
+            prepare_fn, run_fn, destroy_fn, warmup=warmup, iters=iters
+        )
+
+    warmup = max(0, int(warmup))
+    iters = max(1, int(iters))
+    state = None
+    start_evt = None
+    stop_evt = None
+    try:
+        state = prepare_fn()
+        output = None
+        for _ in range(warmup):
+            output = run_fn(state)
+
+        _ACCEL.synchronize()
+        start_evt = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(start)")
+        stop_evt = _hip_check_result(hip.hipEventCreate(), "hipEventCreate(stop)")
+        _hip_event_record_stream(start_evt, event_stream, "hipEventRecord(start)")
+        for _ in range(iters):
+            output = run_fn(state)
+        _hip_event_record_stream(stop_evt, event_stream, "hipEventRecord(stop)")
+        _hip_check_result(hip.hipEventSynchronize(stop_evt), "hipEventSynchronize(stop)")
+        return output, _hip_event_elapsed_ms(start_evt, stop_evt) / iters
+    finally:
+        _destroy_hip_event(stop_evt)
+        _destroy_hip_event(start_evt)
+        if state is not None:
+            destroy_fn(state)
+
+
+def _benchmark_cuda_graph_op(
+    op,
+    *,
+    graph_batch=100,
+    warmup=20,
+    repeats=10,
+    capture_setup=None,
+):
+    """Measure allocation-free CUDA work without Python/FFI launch gaps.
+
+    Falls back to plain event timing on backends without graph capture (MUSA and
+    Ascend may not expose it); the return contract is the same either way.
+    """
+    graph_batch = max(1, int(graph_batch))
+    warmup = max(0, int(warmup))
+    repeats = max(1, int(repeats))
+
+    if not _accel_graph_available():
+        if capture_setup is not None:
+            capture_setup()
+        _, ms = _benchmark_cuda_op(op, warmup=warmup, iters=graph_batch)
+        return ms
+
+    _ACCEL.synchronize()
+    capture_stream = _ACCEL.Stream()
+    graph = _ACCEL.CUDAGraph()
+
+    with _ACCEL.stream(capture_stream):
+        if capture_setup is not None:
+            capture_setup()
+        op()
+    capture_stream.synchronize()
+
+    with _ACCEL.graph(graph, stream=capture_stream):
+        for _ in range(graph_batch):
+            op()
+    capture_stream.synchronize()
+
+    with _ACCEL.stream(capture_stream):
+        for _ in range(warmup):
+            graph.replay()
+    capture_stream.synchronize()
+
+    samples_ms = []
+    start = _ACCEL.Event(enable_timing=True)
+    end = _ACCEL.Event(enable_timing=True)
+    for _ in range(repeats):
+        with _ACCEL.stream(capture_stream):
+            start.record()
+            graph.replay()
+            end.record()
+        end.synchronize()
+        samples_ms.append(float(start.elapsed_time(end)) / graph_batch)
+
+    return statistics.median(samples_ms)
+
+
+# ---------------------------------------------------------------------------
+# Dense prologue for the accumulate-style sparse routes.
+#
+# Several routes (CSC op="non", BSR both directions, the COO atomic variants)
+# build their result with tl.atomic_add, which requires the destination to hold
+# the right starting value. This module's own callers allocate a zeroed output
+# and never need more than that, so nothing here uses this kernel today -- it
+# exists for the C API, which has to express cuSPARSE's
+# ``y = alpha*op(A)*x + beta*y`` on those same routes and therefore needs
+# ``y = beta*y`` (or a true zero) applied first.
+#
+# It lives here rather than in the C wrapper for the reason every other kernel
+# does: one source of truth. The C++ dispatch layer re-exports it.
+#
+# HAS_BETA is constexpr and False must store a LITERAL zero, never
+# ``load(...) * 0``: cuSPARSE defines beta == 0 as "do not read the output", and
+# an uninitialised buffer holding NaN would survive the multiply.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _dense_scale_kernel(
+    ptr,
+    beta_re,
+    beta_im,
+    n_rows,
+    n_cols,
+    stride_m,
+    stride_n,
+    stride_r,
+    BLOCK_N: tl.constexpr,
+    IS_COMPLEX: tl.constexpr,
+    HAS_BETA: tl.constexpr,
+):
+    """out = beta * out, over an n_rows x n_cols strided dense block.
+
+    A vector is the n_rows == 1 case with stride_m = 0, which keeps the loads
+    contiguous instead of giving every element its own program.
+
+    Complex operands are interleaved real/imag pairs of the component dtype;
+    ``stride_r`` is the step from a real part to its imaginary part.
+    """
+    row = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    if row >= n_rows:
+        return
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_cols
+    p_re = ptr + row * stride_m + offs_n * stride_n
+
+    if IS_COMPLEX:
+        p_im = p_re + stride_r
+        if HAS_BETA:
+            prev_re = tl.load(p_re, mask=mask_n, other=0.0)
+            prev_im = tl.load(p_im, mask=mask_n, other=0.0)
+            out_re = beta_re * prev_re - beta_im * prev_im
+            out_im = beta_re * prev_im + beta_im * prev_re
+        else:
+            out_re = tl.zeros([BLOCK_N], dtype=ptr.dtype.element_ty)
+            out_im = out_re
+        tl.store(p_re, out_re, mask=mask_n)
+        tl.store(p_im, out_im, mask=mask_n)
+    else:
+        if HAS_BETA:
+            out = beta_re * tl.load(p_re, mask=mask_n, other=0.0)
+        else:
+            out = tl.zeros([BLOCK_N], dtype=ptr.dtype.element_ty)
+        tl.store(p_re, out, mask=mask_n)
+
+
+@triton.jit
+def _dense_copy_kernel(
+    src_ptr,
+    dst_ptr,
+    n_rows,
+    n_cols,
+    src_stride_m,
+    src_stride_n,
+    src_stride_r,
+    dst_stride_m,
+    dst_stride_n,
+    dst_stride_r,
+    BLOCK_N: tl.constexpr,
+    IS_COMPLEX: tl.constexpr,
+):
+    """dst = src, over an n_rows x n_cols strided block.
+
+    Like _dense_scale_kernel this exists for the C API rather than for this
+    module. SpSM's solver works in place on a packed row-major work array, while
+    cuSPARSE hands it a separate right-hand side and destination with arbitrary
+    order and leading dimension; this is what moves between the two, and being
+    strided on both sides it needs no layout special-casing.
+    """
+    row = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    if row >= n_rows:
+        return
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_cols
+    s_re = src_ptr + row * src_stride_m + offs_n * src_stride_n
+    d_re = dst_ptr + row * dst_stride_m + offs_n * dst_stride_n
+    tl.store(d_re, tl.load(s_re, mask=mask_n, other=0.0), mask=mask_n)
+    if IS_COMPLEX:
+        tl.store(d_re + dst_stride_r,
+                 tl.load(s_re + src_stride_r, mask=mask_n, other=0.0), mask=mask_n)

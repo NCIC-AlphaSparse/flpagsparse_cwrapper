@@ -1,0 +1,370 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""FlagSparse sparse operations (gather, scatter, SpMV, SpMM, SpGEMM, SDDMM, SpSM)."""
+
+# Per-backend overrides, BEFORE any operator is imported below.
+#
+# Normally a no-op: backends/<name>/ is empty and every import below resolves to
+# the shared implementation in this package. When a backend does ship an override
+# for one operator, this registers it under the shared module's name so the
+# imports below -- and every later caller -- pick it up. See _dispatch.py.
+#
+# Order matters and is enforced: install_overrides() raises if an operator module
+# was already imported, because replacing it then would leave two live copies.
+from ._dispatch import install_overrides as _install_overrides
+
+_install_overrides()
+del _install_overrides
+
+from ._common import SUPPORTED_INDEX_DTYPES, SUPPORTED_VALUE_DTYPES, cp, cpx_sparse
+from .alpha_spmm_alg1 import (
+    PreparedAlphaSpmmAlg1,
+    alpha_spmm_alg1_tle_opt_unavailable_reason,
+    alpha_spmm_alg1_tle_opt2_unavailable_reason,
+    alpha_spmm_alg1_tle_unavailable_reason,
+    build_alpha_spmm_alg1_tle_opt_meta,
+    build_alpha_spmm_alg1_tle_opt2_meta,
+    flagsparse_alpha_spmm_alg1,
+    flagsparse_alpha_spmm_alg1_tle,
+    flagsparse_alpha_spmm_alg1_tle_opt,
+    flagsparse_alpha_spmm_alg1_tle_opt2,
+    is_alpha_spmm_alg1_tle_opt_available,
+    is_alpha_spmm_alg1_tle_opt2_available,
+    is_alpha_spmm_alg1_tle_available,
+    prepare_alpha_spmm_alg1,
+    prepare_alpha_spmm_alg1_tle,
+    prepare_alpha_spmm_alg1_tle_opt,
+    prepare_alpha_spmm_alg1_tle_opt2,
+)
+from .gather_scatter import (
+    benchmark_hipsparse_gather,
+    benchmark_hipsparse_scatter,
+    cusparse_native_gather,
+    cusparse_spmv_gather,
+    cusparse_spmv_scatter,
+    hipsparse_gather,
+    hipsparse_scatter,
+    flagsparse_gather,
+    flagsparse_scatter,
+    pytorch_index_gather,
+    pytorch_index_scatter,
+    triton_cusparse_gather,
+    triton_cusparse_scatter,
+)
+from .sddmm_csr import (
+    SDDMMPrepared,
+    benchmark_sddmm_case,
+    flagsparse_sddmm_csr,
+    prepare_sddmm_csr,
+)
+from .spgemm_csr import (
+    SpGEMMPrepared,
+    benchmark_spgemm_case,
+    flagsparse_spgemm_csr,
+    prepare_spgemm_csr,
+)
+from .spmm_coo import (
+    SPMM_COO_ASCEND_DISPATCH,
+    PreparedCooSpmmRoute,
+    SPMM_COO_ALGORITHMS,
+    SpmmCooAlgorithm,
+    SpmmCooAlgorithmUnavailable,
+    flagsparse_spmm_coo,
+    flagsparse_spmm_coo_run,
+    list_spmm_coo_algorithms,
+    prepare_spmm_coo_route,
+    resolve_spmm_coo_algorithm,
+)
+from .spmm_bsr import (
+    PreparedBsrSpmm,
+    SPMM_BSR_ALGORITHMS,
+    SpmmBsrAlgorithm,
+    SpmmBsrAlgorithmUnavailable,
+    flagsparse_spmm_bsr,
+    flagsparse_spmm_bsr_run,
+    list_spmm_bsr_algorithms,
+    prepare_spmm_bsr_route,
+    resolve_spmm_bsr_algorithm,
+)
+from .spmm_bell import (
+    PreparedBellSpmm,
+    SPMM_BELL_ALGORITHMS,
+    SpmmBellAlgorithm,
+    SpmmBellAlgorithmUnavailable,
+    flagsparse_spmm_bell,
+    flagsparse_spmm_bell_run,
+    list_spmm_bell_algorithms,
+    prepare_spmm_bell_route,
+    resolve_spmm_bell_algorithm,
+)
+from .spmm_csc import (
+    PreparedCscSpmm,
+    SPMM_CSC_ALGORITHMS,
+    SpmmCscAlgorithm,
+    SpmmCscAlgorithmUnavailable,
+    flagsparse_spmm_csc,
+    flagsparse_spmm_csc_run,
+    list_spmm_csc_algorithms,
+    prepare_spmm_csc_route,
+    resolve_spmm_csc_algorithm,
+)
+from .spmm_csr import (
+    PreparedCsrSpmmOpt,
+    PreparedCsrSpmmRoute,
+    SPMM_CSR_ALGORITHMS,
+    SpmmCsrAlgorithmUnavailable,
+    SpmmCsrAlgorithm,
+    benchmark_spmm_case,
+    benchmark_spmm_opt_case,
+    comprehensive_spmm_test,
+    flagsparse_spmm_csr,
+    flagsparse_spmm_csr_opt,
+    flagsparse_spmm_csr_opt_alg1,
+    flagsparse_spmm_csr_opt_alg1_preprocess,
+    flagsparse_spmm_csr_run,
+    list_spmm_csr_algorithms,
+    prepare_spmm_csr_opt,
+    prepare_spmm_csr_opt_alg1,
+    prepare_spmm_csr_opt_alg1_preprocess,
+    prepare_spmm_csr_route,
+    resolve_spmm_csr_algorithm,
+)
+from .spmm_csr_opt_alg2 import (
+    PreparedCsrSpmmOptAlg2,
+    benchmark_spmm_opt_alg2_case,
+    flagsparse_spmm_csr_opt_alg2,
+    flagsparse_spmm_csr_opt_alg2_preprocess,
+    prepare_spmm_csr_opt_alg2,
+    prepare_spmm_csr_opt_alg2_preprocess,
+)
+from .spmv_coo import PreparedCoo, flagsparse_spmv_coo, prepare_spmv_coo
+from .spmv_bsr import PreparedBsrSpmv, flagsparse_spmv_bsr, prepare_spmv_bsr
+from .spmv_csc import PreparedCscSpmv, flagsparse_spmv_csc, prepare_spmv_csc
+from .spmv_csr import (
+    PreparedCsrSpmv,
+    flagsparse_spmv_coo_tocsr,
+    flagsparse_spmv_csr,
+    prepare_spmv_coo_tocsr,
+    prepare_spmv_csr,
+)
+from .spsm import (
+    SPSM_ASCEND_DISPATCH,
+    benchmark_spsm_case,
+    flagsparse_spsm_coo,
+    flagsparse_spsm_csr,
+)
+from .spsv import (
+    FlagSparseDnVecDescr,
+    FlagSparseSpMatDescr,
+    FlagSparseSpSVDescr,
+    FlagSparseSpSVHandle,
+    FlagSparseSpSVWorkspace,
+    flagsparse_create_dnvec,
+    flagsparse_create_spmat_coo,
+    flagsparse_create_spmat_csr,
+    flagsparse_create_spsv_handle,
+    flagsparse_spsv_analysis_coo,
+    flagsparse_spsv_analysis_csr,
+    flagsparse_spsv_analysis_sell,
+    flagsparse_spsv_analysis_ex,
+    flagsparse_spsv_buffer_size,
+    flagsparse_spsv_buffer_size_ex,
+    flagsparse_spsv_coo,
+    flagsparse_spsv_create_workspace,
+    flagsparse_spsv_csr,
+    flagsparse_spsv_sell,
+    flagsparse_spsv_preprocess_coo,
+    flagsparse_spsv_preprocess_csr,
+    flagsparse_spsv_solve_ex,
+    flagsparse_spsv_solve_coo,
+    flagsparse_spsv_solve_csr,
+    flagsparse_spsv_solve_sell,
+)
+
+_BENCHMARK_EXPORTS = {
+    "benchmark_gather_case",
+    "benchmark_performance",
+    "benchmark_scatter_case",
+    "benchmark_spmv_case",
+    "comprehensive_gather_test",
+    "comprehensive_scatter_test",
+    "comprehensive_spsm_test",
+}
+
+__all__ = [
+    "PreparedCoo",
+    "PreparedCooSpmmRoute",
+    "PreparedAlphaSpmmAlg1",
+    "PreparedBsrSpmv",
+    "PreparedBsrSpmm",
+    "PreparedBellSpmm",
+    "PreparedCscSpmm",
+    "PreparedCsrSpmv",
+    "PreparedCscSpmv",
+    "PreparedCsrSpmmOpt",
+    "PreparedCsrSpmmRoute",
+    "PreparedCsrSpmmOptAlg2",
+    "SDDMMPrepared",
+    "SpGEMMPrepared",
+    "SUPPORTED_INDEX_DTYPES",
+    "SUPPORTED_VALUE_DTYPES",
+    "FlagSparseDnVecDescr",
+    "SpmmCsrAlgorithm",
+    "SpmmCsrAlgorithmUnavailable",
+    "SpmmCooAlgorithm",
+    "SpmmCooAlgorithmUnavailable",
+    "SpmmBsrAlgorithm",
+    "SpmmBsrAlgorithmUnavailable",
+    "SpmmBellAlgorithm",
+    "SpmmBellAlgorithmUnavailable",
+    "SpmmCscAlgorithm",
+    "SpmmCscAlgorithmUnavailable",
+    "FlagSparseSpMatDescr",
+    "FlagSparseSpSVDescr",
+    "FlagSparseSpSVHandle",
+    "FlagSparseSpSVWorkspace",
+    "benchmark_gather_case",
+    "benchmark_performance",
+    "benchmark_scatter_case",
+    "benchmark_sddmm_case",
+    "benchmark_spgemm_case",
+    "benchmark_spmm_case",
+    "benchmark_spmm_opt_case",
+    "benchmark_spmm_opt_alg2_case",
+    "benchmark_spmv_case",
+    "SPSM_ASCEND_DISPATCH",
+    "benchmark_spsm_case",
+    "comprehensive_gather_test",
+    "comprehensive_scatter_test",
+    "comprehensive_spmm_test",
+    "comprehensive_spsm_test",
+    "cusparse_spmv_gather",
+    "cusparse_spmv_scatter",
+    "cusparse_native_gather",
+    "hipsparse_gather",
+    "hipsparse_scatter",
+    "benchmark_hipsparse_gather",
+    "benchmark_hipsparse_scatter",
+    "flagsparse_gather",
+    "flagsparse_alpha_spmm_alg1",
+    "flagsparse_alpha_spmm_alg1_tle",
+    "flagsparse_alpha_spmm_alg1_tle_opt",
+    "flagsparse_alpha_spmm_alg1_tle_opt2",
+    "flagsparse_sddmm_csr",
+    "flagsparse_spgemm_csr",
+    "SPMM_COO_ASCEND_DISPATCH",
+    "flagsparse_spmm_coo",
+    "flagsparse_spmm_bsr",
+    "flagsparse_spmm_bsr_run",
+    "flagsparse_spmm_bell",
+    "flagsparse_spmm_bell_run",
+    "flagsparse_spmm_csc",
+    "flagsparse_spmm_csc_run",
+    "flagsparse_spmm_coo_run",
+    "flagsparse_spmm_csr",
+    "flagsparse_spmm_csr_run",
+    "flagsparse_spmm_csr_opt",
+    "flagsparse_spmm_csr_opt_alg1",
+    "flagsparse_spmm_csr_opt_alg1_preprocess",
+    "flagsparse_spmm_csr_opt_alg2",
+    "flagsparse_spmm_csr_opt_alg2_preprocess",
+    "flagsparse_spmv_coo",
+    "flagsparse_spmv_bsr",
+    "flagsparse_spmv_coo_tocsr",
+    "flagsparse_spmv_csc",
+    "flagsparse_spmv_csr",
+    "flagsparse_spsm_coo",
+    "flagsparse_spsm_csr",
+    "flagsparse_create_dnvec",
+    "flagsparse_create_spmat_coo",
+    "flagsparse_create_spmat_csr",
+    "flagsparse_create_spsv_handle",
+    "flagsparse_spsv_analysis_coo",
+    "flagsparse_spsv_analysis_csr",
+    "flagsparse_spsv_analysis_sell",
+    "flagsparse_spsv_analysis_ex",
+    "flagsparse_spsv_buffer_size",
+    "flagsparse_spsv_buffer_size_ex",
+    "flagsparse_spsv_coo",
+    "flagsparse_spsv_create_workspace",
+    "flagsparse_spsv_csr",
+    "flagsparse_spsv_sell",
+    "flagsparse_spsv_preprocess_coo",
+    "flagsparse_spsv_preprocess_csr",
+    "flagsparse_spsv_solve_ex",
+    "flagsparse_spsv_solve_coo",
+    "flagsparse_spsv_solve_csr",
+    "flagsparse_spsv_solve_sell",
+    "list_spmm_csr_algorithms",
+    "list_spmm_coo_algorithms",
+    "list_spmm_bsr_algorithms",
+    "list_spmm_bell_algorithms",
+    "list_spmm_csc_algorithms",
+    "prepare_sddmm_csr",
+    "build_alpha_spmm_alg1_tle_opt_meta",
+    "build_alpha_spmm_alg1_tle_opt2_meta",
+    "prepare_alpha_spmm_alg1",
+    "prepare_alpha_spmm_alg1_tle",
+    "prepare_alpha_spmm_alg1_tle_opt",
+    "prepare_alpha_spmm_alg1_tle_opt2",
+    "is_alpha_spmm_alg1_tle_available",
+    "is_alpha_spmm_alg1_tle_opt_available",
+    "is_alpha_spmm_alg1_tle_opt2_available",
+    "alpha_spmm_alg1_tle_unavailable_reason",
+    "alpha_spmm_alg1_tle_opt_unavailable_reason",
+    "alpha_spmm_alg1_tle_opt2_unavailable_reason",
+    "prepare_spgemm_csr",
+    "prepare_spmm_csr_opt",
+    "prepare_spmm_csr_opt_alg1",
+    "prepare_spmm_csr_opt_alg1_preprocess",
+    "prepare_spmm_csr_route",
+    "prepare_spmm_coo_route",
+    "prepare_spmm_bsr_route",
+    "prepare_spmm_bell_route",
+    "prepare_spmm_csc_route",
+    "prepare_spmm_csr_opt_alg2",
+    "prepare_spmm_csr_opt_alg2_preprocess",
+    "prepare_spmv_coo",
+    "prepare_spmv_bsr",
+    "prepare_spmv_coo_tocsr",
+    "prepare_spmv_csc",
+    "prepare_spmv_csr",
+    "resolve_spmm_csr_algorithm",
+    "resolve_spmm_coo_algorithm",
+    "resolve_spmm_bsr_algorithm",
+    "resolve_spmm_bell_algorithm",
+    "resolve_spmm_csc_algorithm",
+    "SPMM_COO_ALGORITHMS",
+    "SPMM_CSR_ALGORITHMS",
+    "SPMM_BSR_ALGORITHMS",
+    "SPMM_BELL_ALGORITHMS",
+    "SPMM_CSC_ALGORITHMS",
+    "pytorch_index_gather",
+    "pytorch_index_scatter",
+    "triton_cusparse_gather",
+    "triton_cusparse_scatter",
+]
+
+
+def __getattr__(name):
+    if name in _BENCHMARK_EXPORTS:
+        from . import benchmarks as _benchmarks
+
+        return getattr(_benchmarks, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))
