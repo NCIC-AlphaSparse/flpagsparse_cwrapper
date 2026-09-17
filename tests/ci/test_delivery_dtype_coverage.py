@@ -27,7 +27,6 @@ from pathlib import Path
 
 from tools.delivery_variants import load_delivery_variants
 
-
 ROOT = Path(__file__).resolve().parents[2]
 
 # The registry's dtype tags, in the spelling the benchmark CLIs use.

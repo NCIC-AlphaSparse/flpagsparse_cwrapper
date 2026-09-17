@@ -174,7 +174,7 @@ if _is_<backend>_runtime():      # 来自 _common.py，已在 __all__ 里
 ## 6. 验收
 
 ```bash
-python3 -m pytest tests/ci -q        # 必须仍是 80 passed / 3 skipped
+python3 -m pytest tests/ci -q        # 当前基线：87 passed / 3 skipped
 ```
 
 `tests/ci` 不需要 GPU，是策略/契约测试。**任何后端改动都不应该让它变红**；变红就说明
@@ -182,6 +182,36 @@ python3 -m pytest tests/ci -q        # 必须仍是 80 passed / 3 skipped
 
 CUDA 侧的回归基线（供对比）：`tests/pytest` 1613 passed / 3 failed，那 3 个是既有 flaky
 （随机输入未固定种子，CUDA 上同样复现）。
+
+### 提交前跑完整的那套
+
+```bash
+git add <你新建的文件>          # 见下，这一步不能省
+make compile format-check lint lint-src pre-commit-check test-ci
+```
+
+**⚠️ 新建的文件必须先 `git add`，否则 pre-commit 看不见它。** `pre-commit run --all-files`
+只处理 **git 跟踪中的文件**，未跟踪的新文件会被整个跳过——本地一路绿灯，推上去 CI 立刻红。
+这个坑刚发生过：一个新增的 CI 测试文件在本地跳过了 isort，提交后 CI 在 `pre-commit-check`
+挂掉，原因只是 import 块后多了一个空行。`git add` 之后（不必 commit）hook 就能看见。
+
+**还有两条与 CI 环境有关的，写新测试时注意**：
+
+* **CI 的 runner 是 CPU-only，不装 torch**（`tools/ci/requirements-ci.lock.txt` 只有工具链）。
+  `tests/ci` 里任何会 import `flagsparse`（进而 import torch）的测试——包括通过子进程
+  间接 import 的——都要在模块顶部加
+  `pytest.importorskip("torch", reason="tests/ci runs on a CPU-only runner without torch")`，
+  否则在 CI 上是 failed 而不是 skipped。要验证，用假 torch 模拟那台机器：
+
+  ```bash
+  echo 'raise ImportError("simulated")' > torch.py
+  python3 -m pytest tests/ci -q      # 应当只有 skipped，没有 failed
+  rm torch.py
+  ```
+
+* **`make ci` 的步骤是有顺序的**：`format-check → lint → lint-src → pre-commit-check →
+  build → install-wheel → test-ci`。前面任何一步失败，后面的**根本不会跑**——所以"CI 只报了
+  一个错"不等于"只有一个错"。本地按上面那条命令一次跑完，才能看到全部。
 
 ---
 
