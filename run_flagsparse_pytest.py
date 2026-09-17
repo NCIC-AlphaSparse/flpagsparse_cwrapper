@@ -155,6 +155,14 @@ PERFORMANCE_SPEEDUP_SCHEMAS = (
     ("speedup", "latency_base", "latency"),
     ("triton_speedup_vs_cusparse", "cusparse_ms", "triton_ms"),
     ("triton_speedup_vs_cupy", "cupy_ms", "triton_ms"),
+    # spmm_coo carries BOTH triton_speedup_vs_pytorch (over torch_ms) and
+    # cusparse_vs_alg_speedup (over cusparse_ms). The vendor one has to be ahead
+    # of the PyTorch ones or that operator alone keeps reporting against torch
+    # while everything else reports against cuSPARSE -- vendor-first holding for
+    # ten operators and quietly not for the eleventh.
+    ("cusparse_vs_alg2_speedup", "cusparse_ms", "alg2_ms"),
+    ("cusparse_vs_alg1_speedup", "cusparse_ms", "alg1_ms"),
+    ("cusparse_vs_alg_speedup", "cusparse_ms", "ms"),
     ("triton_speedup_vs_pytorch", "pytorch_ms", "triton_ms"),
     ("triton_speedup_vs_pytorch", "pytorch_ms", "ms"),
     ("triton_speedup_vs_pytorch", "torch_ms", "ms"),
@@ -166,9 +174,6 @@ PERFORMANCE_SPEEDUP_SCHEMAS = (
     ("opt_speedup_vs_cusparse", "cusparse_ms", "opt_ms"),
     ("opt_speedup_vs_pytorch", "pytorch_ms", "opt_ms"),
     ("opt_vs_base", "base_ms", "opt_ms"),
-    ("cusparse_vs_alg2_speedup", "cusparse_ms", "alg2_ms"),
-    ("cusparse_vs_alg1_speedup", "cusparse_ms", "alg1_ms"),
-    ("cusparse_vs_alg_speedup", "cusparse_ms", "ms"),
     ("base_vs_alg2_speedup", "base_ms", "alg2_ms"),
     ("base_vs_alg1_speedup", "base_ms", "alg1_ms"),
     ("torch_vs_alg2_speedup", "torch_ms", "alg2_ms"),
