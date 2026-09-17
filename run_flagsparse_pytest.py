@@ -136,45 +136,72 @@ PERFORMANCE_METRIC_COLUMNS = {
     "max_abs_err",
     "max_rel_err",
 }
+# VENDOR FIRST, PyTorch as the fallback. The runner reports the first non-empty
+# match, so within every family the vendor pair is listed ahead of the PyTorch
+# pair: on CUDA and ROCm the number is FlagSparse against cuSPARSE / hipSPARSE,
+# and only an operator the vendor library does not implement falls through to
+# the PyTorch metric. A backend with no vendor column at all -- MACA, MUSA, XPU --
+# falls through for every operator, which is the same rule, not an exception.
+#
+# This ordering used to be the other way round for the `triton_*` family while a
+# comment further down claimed the vendor metric won; it did not, and every CUDA
+# speedup in the delivery report was against PyTorch.
+#
+# A speedup name can appear more than once with different column layouts --
+# spmm_coo reports triton_speedup_vs_pytorch over torch_ms/ms while spmm_csc uses
+# pytorch_ms/ms -- so each layout is listed and _performance_schema prefers the
+# entry whose measurement columns the row actually carries.
 PERFORMANCE_SPEEDUP_SCHEMAS = (
     ("speedup", "latency_base", "latency"),
+    ("triton_speedup_vs_cusparse", "cusparse_ms", "triton_ms"),
+    ("triton_speedup_vs_cupy", "cupy_ms", "triton_ms"),
     ("triton_speedup_vs_pytorch", "pytorch_ms", "triton_ms"),
-    # spmm_coo and spmm_csc reuse the same speedup name with their own column layout:
-    # spmm_coo's baseline is torch_ms and its latency is "ms"; spmm_csc uses pytorch_ms
-    # with "ms".  Both are listed so a row resolves whichever pair it actually carries --
-    # pointing the name at only one pair makes the other operator's rows fail the
-    # completeness check and drop out of the aggregate entirely.
     ("triton_speedup_vs_pytorch", "pytorch_ms", "ms"),
     ("triton_speedup_vs_pytorch", "torch_ms", "ms"),
-    ("triton_speedup_vs_cusparse", "cusparse_ms", "triton_ms"),
-    # After vs_cusparse on purpose: the runner reports the first non-empty match, so on
-    # CUDA the vendor metric keeps winning (same measurement, historical label), while a
-    # backend with no vendor column falls through to the PyTorch API metric.
     ("triton_speedup_vs_pytorch_api", "pytorch_api_ms", "triton_ms"),
-    ("triton_speedup_vs_cupy", "cupy_ms", "triton_ms"),
-    ("csc_speedup_vs_pytorch", "pytorch_ms", "csc_ms"),
     ("csc_speedup_vs_cusparse", "cusparse_ms", "csc_ms"),
-    ("bsr_speedup_vs_pytorch", "pytorch_ms", "bsr_ms"),
+    ("csc_speedup_vs_pytorch", "pytorch_ms", "csc_ms"),
     ("bsr_speedup_vs_cusparse", "cusparse_ms", "bsr_ms"),
-    ("opt_speedup_vs_pytorch", "pytorch_ms", "opt_ms"),
+    ("bsr_speedup_vs_pytorch", "pytorch_ms", "bsr_ms"),
     ("opt_speedup_vs_cusparse", "cusparse_ms", "opt_ms"),
+    ("opt_speedup_vs_pytorch", "pytorch_ms", "opt_ms"),
     ("opt_vs_base", "base_ms", "opt_ms"),
+    ("cusparse_vs_alg2_speedup", "cusparse_ms", "alg2_ms"),
+    ("cusparse_vs_alg1_speedup", "cusparse_ms", "alg1_ms"),
+    ("cusparse_vs_alg_speedup", "cusparse_ms", "ms"),
     ("base_vs_alg2_speedup", "base_ms", "alg2_ms"),
     ("base_vs_alg1_speedup", "base_ms", "alg1_ms"),
     ("torch_vs_alg2_speedup", "torch_ms", "alg2_ms"),
     ("torch_vs_alg1_speedup", "torch_ms", "alg1_ms"),
-    ("cusparse_vs_alg2_speedup", "cusparse_ms", "alg2_ms"),
-    ("cusparse_vs_alg1_speedup", "cusparse_ms", "alg1_ms"),
-    ("cusparse_vs_alg_speedup", "cusparse_ms", "ms"),
-    ("pytorch_speedup_solve", "pytorch_ms", "solve_ms"),
-    ("cusparse_speedup_solve", "cusparse_ms", "solve_ms"),
-    ("pytorch_speedup_total", "pytorch_ms", "triton_total_ms"),
-    ("cusparse_speedup_total", "cusparse_ms", "triton_total_ms"),
     ("torch_vs_alg_speedup", "torch_ms", "ms"),
+    ("cusparse_speedup_solve", "cusparse_ms", "solve_ms"),
+    ("pytorch_speedup_solve", "pytorch_ms", "solve_ms"),
+    ("cusparse_speedup_total", "cusparse_ms", "triton_total_ms"),
+    ("pytorch_speedup_total", "pytorch_ms", "triton_total_ms"),
     ("scipy_vs_alg_speedup", "scipy_cpu_ms", "ms"),
     ("prepared_speedup_vs_pytorch", "pytorch_ms", "prepared_ms"),
-    ("FlagSparse_vs_PyTorch_speedup", "pytorch_ms", "flagsparse_ms"),
+    # SpSV and SpSM spell their columns in the vendor's own casing, and SpSV
+    # names the CuPy route explicitly. Column lookup is case-insensitive (see
+    # _row_value), so "cuSPARSE_ms" resolves against "cusparse_ms" here, but a
+    # DIFFERENT name still needs its own entry -- which is why the two below
+    # exist and why these operators used to report a speedup with both
+    # latencies reading 0.00 ms.
+    ("FlagSparse_vs_CuPy/cuSPARSE_speedup", "CuPy/cuSPARSE_ms", "flagsparse_ms"),
     ("FlagSparse_vs_cuSPARSE_speedup", "cusparse_ms", "flagsparse_ms"),
+    # SpSV names its columns after the ACTIVE vendor label, so DCU writes
+    # hipSPARSE_ms and FlagSparse_vs_hipSPARSE_all_speedup (the `_all` suffix is
+    # ROCm-only: that path reports bufferSize/analysis/solve separately). Without
+    # these two entries the DCU rows matched nothing and fell through to the
+    # PyTorch metric -- vendor-first would have held on CUDA and quietly not on DCU.
+    ("FlagSparse_vs_hipSPARSE_all_speedup", "hipsparse_ms", "flagsparse_ms"),
+    ("FlagSparse_vs_hipSPARSE_speedup", "hipsparse_ms", "flagsparse_ms"),
+    ("FlagSparse_vs_vendor_speedup", "cusparse_ms", "flagsparse_ms"),
+    ("FlagSparse_vs_vendor_speedup", "hipsparse_ms", "flagsparse_ms"),
+    # Backends whose vendor is torch.sparse, or which have none, write a neutral
+    # `vendor_ms` rather than a column named after the PyTorch label or "N/A".
+    ("FlagSparse_vs_vendor_speedup", "vendor_ms", "flagsparse_ms"),
+    ("FlagSparse_vs_PyTorch_all_speedup", "pytorch_ms", "flagsparse_ms"),
+    ("FlagSparse_vs_PyTorch_speedup", "pytorch_ms", "flagsparse_ms"),
 )
 
 
@@ -1769,6 +1796,25 @@ def _detail_shape(row: dict[str, str], index: int, seen: set[str]) -> str:
     return fallback
 
 
+def _row_value(row: dict[str, str], key: str | None):
+    """Read a CSV column, tolerating the vendor's own casing.
+
+    SpSV and SpSM write `FlagSparse_ms`, `PyTorch_ms`, `cuSPARSE_ms`; the schema
+    table spells them lowercase. A case-sensitive `row.get()` missed every one of
+    them, so those ten delivery variants reported a speedup with both latencies
+    reading 0.00 ms -- a number that looks measured and is not.
+    """
+    if key is None:
+        return None
+    if key in row:
+        return row[key]
+    lowered = key.lower()
+    for name, value in row.items():
+        if name.lower() == lowered:
+            return value
+    return None
+
+
 def _is_metric_column(key: str) -> bool:
     lowered = key.lower()
     return (
@@ -1801,12 +1847,12 @@ def _performance_schema(row: dict[str, str]) -> tuple[str, str | None, str | Non
     # columns the row actually carries.  Without this the first entry always wins and
     # the other operator's rows fail the completeness check and vanish from aggregates.
     for speedup_key, base_key, latency_key in PERFORMANCE_SPEEDUP_SCHEMAS:
-        if not row.get(speedup_key):
+        if not _row_value(row, speedup_key):
             continue
-        if all(key is None or row.get(key) for key in (base_key, latency_key)):
+        if all(key is None or _row_value(row, key) for key in (base_key, latency_key)):
             return speedup_key, base_key, latency_key
     for speedup_key, base_key, latency_key in PERFORMANCE_SPEEDUP_SCHEMAS:
-        if row.get(speedup_key):
+        if _row_value(row, speedup_key):
             return speedup_key, base_key, latency_key
     for key, value in row.items():
         if "speedup" in key.lower() and value:
@@ -1910,13 +1956,13 @@ def _performance_row_has_complete_speedup(row: dict[str, str]) -> bool:
     if not _performance_row_status_is_usable(row):
         return False
     speedup_key, base_key, latency_key = _performance_schema(row)
-    speedup = _to_float(row.get(speedup_key))
+    speedup = _to_float(_row_value(row, speedup_key))
     if speedup is None or speedup <= 0:
         return False
     for key in (base_key, latency_key):
         if key is None:
             continue
-        measurement = _to_float(row.get(key))
+        measurement = _to_float(_row_value(row, key))
         if measurement is None or measurement <= 0:
             return False
     return True
@@ -1924,9 +1970,9 @@ def _performance_row_has_complete_speedup(row: dict[str, str]) -> bool:
 
 def _benchmark_json_detail(row: dict[str, str], index: int) -> dict[str, object]:
     speedup_key, base_key, latency_key = _performance_schema(row)
-    base = _to_float(row.get(base_key)) if base_key else None
-    latency = _to_float(row.get(latency_key)) if latency_key else None
-    speedup = _to_float(row.get(speedup_key))
+    base = _to_float(_row_value(row, base_key))
+    latency = _to_float(_row_value(row, latency_key))
+    speedup = _to_float(_row_value(row, speedup_key))
     # ``None`` means "no measurement", which is not the same claim as a
     # measured 0.0: benchmarks whose CSV carries no speedup column (SpMV CSC,
     # SpMM CSC/BSR on DCU, where no vendor baseline runs) used to be reported
@@ -2000,8 +2046,8 @@ def _flaggems_perf_data(rows: list[dict[str, str]]) -> dict[str, object]:
         dtype = _row_dtype(row)
         shape = _detail_shape(row, index, seen_by_dtype.setdefault(dtype, set()))
         speedup_key, base_key, latency_key = _performance_schema(row)
-        speedup = _to_float(row.get(speedup_key))
-        base = _to_float(row.get(base_key)) if base_key else None
+        speedup = _to_float(_row_value(row, speedup_key))
+        base = _to_float(_row_value(row, base_key))
         latency = _to_float(row.get(latency_key)) if latency_key else None
 
         dtype_entry = grouped.setdefault(
@@ -3538,6 +3584,27 @@ def _print_ops(ops: list[str], phase_arg: str = "both") -> None:
             print(f"{op}\taccuracy={accuracy}\tperformance={performance}")
 
 
+def warn_if_backend_fell_back() -> str | None:
+    """Say so, loudly, when the selected backend is not the one that will run.
+
+    Nothing in this pipeline checked this before. A box without the vendor plugin
+    answers FLAGSPARSE_BACKEND=<vendor> by running every kernel on torch.cuda,
+    and the whole suite then passes 40/40 with CUDA numbers under the vendor's
+    name -- a result that is worse than a failure, because it looks like one that
+    can be reported.
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+        from flagsparse.sparse_operations._common import _accel_fallback_reason
+    except Exception:
+        return None
+    reason = _accel_fallback_reason()
+    if reason:
+        banner = "!" * 78
+        print(f"\n{banner}\nWARNING: {reason}\n{banner}\n", file=sys.stderr, flush=True)
+    return reason
+
+
 def main(
     default_phase: str = "both",
     expose_phase_arg: bool = True,
@@ -3632,6 +3699,7 @@ def main(
     phase_arg = args.phase if expose_phase_arg else default_phase
 
     project_root = Path(__file__).resolve().parent
+    warn_if_backend_fell_back()
     ops = read_ops(
         project_root=project_root,
         operators_yaml=args.operators_yaml,

@@ -24,8 +24,24 @@ print("torch.npu:", hasattr(torch, "npu"), torch.npu.is_available())
 PY
 ```
 
-`ops_sparse` Python bridge 和 `libaclsparse.so` 是可选的；缺失时 baseline 明确使用
-PyTorch-NPU。
+**性能 baseline 现在默认就是 PyTorch**（`FLAGSPARSE_ASCEND_VENDOR=torch`），不再是
+"ops-sparse 优先、缺失才回落"——这样昇腾这一列和其余非 CUDA 后端量的是同一个参照。
+`ops_sparse` Python bridge 和 `libaclsparse.so` 仍然可选，装了就能用
+`FLAGSPARSE_ASCEND_VENDOR=ops_sparse` 选回去做一次厂商 A/B。
+
+**精度参考是 CPU 上的 SciPy**（见仓库根 `README.md` 的 `FLAGSPARSE_ACCURACY_REFERENCE`）：
+昇腾上的 torch.sparse 本身就是被测对象而不是参考。
+
+## 跑哪些算子
+
+`--delivery-only` 让 runner 从 `conf/operators.yaml` 的 `delivery_variants` 反推该跑的
+算子（40 个交付变体来自 11 个父算子），不用手写 `--ops`。不给这个参数会读 yaml 的
+`ops:` 清单，那是个超集（18 个）—— 不会漏变体，但会多跑 7 个结果进不了 `summary.json`
+的算子。
+
+Ascend 的路由与其他后端不同：五个算子（gather / scatter / spmv_csr / spmm_csr /
+sddmm_csr）走 `benchmark/benchmark_ascend.py`，其余走能力探测
+`benchmark/benchmark_ascend_probe.py`，两者都由 runner 自动选，见下文。
 
 ## Ascend fallback 分发表
 
@@ -153,8 +169,8 @@ tail -f pytest_ascend_<时间戳>.log
 
 ## 已知限制
 
-- 未安装 `ops_sparse`/`libaclsparse.so` 时，输出中的 baseline 是 PyTorch-NPU，不是
-  ops-sparse。
+- 输出中的 baseline 默认就是 PyTorch-NPU 而非 ops-sparse，这是**策略**不是缺失；
+  要 ops-sparse 得显式 `FLAGSPARSE_ASCEND_VENDOR=ops_sparse`，且它确实装了。
 - 测试前确认 6、7 号卡没有其他任务：`npu-smi info`。
 - 若 runner 显示 `Skipped`，检查是否导出了 `FLAGSPARSE_BACKEND=ascend`；没有该变量时
   runner 按 CUDA/其他后端流程执行。

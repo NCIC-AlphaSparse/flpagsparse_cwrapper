@@ -339,11 +339,15 @@ __all__ = (
     "_maca_vendor_sparse_library",
     "_mthreads_vendor_sparse_library",
     "_ascend_vendor_sparse_library",
+    "_xpu_vendor_sparse_library",
+    "_use_scipy_accuracy_reference",
+    "_accuracy_reference_label",
     "_is_ops_sparse_available",
     "_ops_sparse_unavailable_reason",
     "ops_sparse",
     "_vendor_sparse_library",
     "_is_hipsparse_available",
+    "_is_cupy_available",
     "_require_cupy",
     "_cupy_dtype_from_torch",
     "_cupy_from_torch",
@@ -806,12 +810,37 @@ def _accel_fallback_reason():
 
     Non-None means the selected backend's torch extension is missing, so the
     package is running on torch.cuda despite FLAGSPARSE_BACKEND asking otherwise.
+
+    DERIVED FROM THE REGISTRY, not a hand-written list. It used to name mthreads
+    and ascend only, so FLAGSPARSE_BACKEND=xpu on a box with no Kunlunxin plugin
+    reported backend "xpu", ran every kernel on torch.cuda, and answered None
+    here -- the one check the docs tell people to run before trusting a result.
+    gcu and mlu had the same hole. Every backend that declares a torch namespace
+    is covered now, including ones added later.
     """
-    if _IS_MTHREADS_RUNTIME and getattr(torch, "musa", None) is None:
-        return "backend 'mthreads' selected but torch.musa is unavailable (torch_musa not installed?); falling back to torch.cuda"
-    if _IS_ASCEND_RUNTIME and getattr(torch, "npu", None) is None:
-        return "backend 'ascend' selected but torch.npu is unavailable (torch_npu not installed?); falling back to torch.cuda"
-    return None
+    name = _backend_name()
+    spec = _BACKEND_SPEC_BY_NAME.get(name)
+    if spec is None or not spec.torch_namespace:
+        return None
+    if spec.torch_namespace == "cuda":
+        return None
+    # The namespace alone is not evidence, for the same reason detection does not
+    # take it: upstream PyTorch ships torch.xpu for Intel GPUs, so a box with no
+    # Kunlunxin plugin answers getattr(torch, "xpu") and this check stayed silent
+    # while every kernel ran on CUDA under the name "xpu".
+    has_namespace = getattr(torch, spec.torch_namespace, None) is not None
+    has_plugin = _vendor_plugin_present(spec) if spec.plugin_modules else True
+    if has_namespace and has_plugin:
+        return None
+    plugins = " or ".join(spec.plugin_modules) or "its torch plugin"
+    if not has_namespace:
+        missing = f"torch.{spec.torch_namespace} is unavailable ({plugins} not installed?)"
+    else:
+        missing = (
+            f"torch.{spec.torch_namespace} exists but {plugins} does not import, "
+            "so the namespace belongs to some other vendor"
+        )
+    return f"backend {name!r} selected but {missing}; falling back to torch.cuda"
 
 
 def _is_accel_tensor(t):
@@ -909,21 +938,26 @@ _ACCEL_DEVICE_TYPE = _accel_device_type()
 
 
 def _maca_vendor_sparse_library():
-    """Which vendor sparse library MetaX/MACA uses for reference baselines.
+    """Baseline library on MetaX/MACA: CuPy when it is really installed, else PyTorch.
 
-    MACA is CUDA-source-compatible, so CuPy/cuSPARSE-style calls are the working
-    default until a native mcSPARSE binding is wired up. Override with
-    FLAGSPARSE_MACA_VENDOR=cupy_cusparse|none.
+    MACA is CUDA-source-compatible, so CuPy/cuSPARSE-style calls do work where
+    CuPy is present, and that is the better reference when it is. But it is a
+    compatibility path rather than the vendor's own sparse library -- mcSPARSE
+    has no Python binding here -- and the C550 box this was brought up on has no
+    CuPy at all. So the choice is PROBED rather than assumed: torch.sparse is
+    the fallback, and it is present on every install.
+
+    Override with FLAGSPARSE_MACA_VENDOR=torch|cupy_cusparse|none.
     """
     override = os.environ.get("FLAGSPARSE_MACA_VENDOR", "").strip().lower()
-    if override in ("cupy_cusparse", "none"):
+    if override in ("torch", "cupy_cusparse", "none"):
         return None if override == "none" else override
     if override:
         raise ValueError(
-            "FLAGSPARSE_MACA_VENDOR must be 'cupy_cusparse' or 'none', "
+            "FLAGSPARSE_MACA_VENDOR must be 'torch', 'cupy_cusparse' or 'none'; "
             f"got {override!r}"
         )
-    return "cupy_cusparse"
+    return "cupy_cusparse" if _is_cupy_available() else "torch"
 
 
 def _mthreads_vendor_sparse_library():
@@ -986,10 +1020,14 @@ def _ops_sparse_unavailable_reason():
 
 
 def _ascend_vendor_sparse_library():
-    """Baseline library on Ascend: CANN's ops-sparse when importable.
+    """Baseline library on Ascend: PyTorch.
 
-    Falls back to torch.sparse when it is not. Override with
-    FLAGSPARSE_ASCEND_VENDOR=ops_sparse|torch|none.
+    CANN ships ops-sparse, but the reported baseline is torch.sparse so that the
+    Ascend column measures the same reference the other non-CUDA backends do.
+    ops-sparse stays one env var away for a vendor A/B, and is only offered when
+    it actually imports -- see _is_ops_sparse_available().
+
+    Override with FLAGSPARSE_ASCEND_VENDOR=torch|ops_sparse|none.
     """
     override = os.environ.get("FLAGSPARSE_ASCEND_VENDOR", "").strip().lower()
     if override in ("ops_sparse", "torch", "none"):
@@ -999,14 +1037,75 @@ def _ascend_vendor_sparse_library():
             "FLAGSPARSE_ASCEND_VENDOR must be 'ops_sparse', 'torch' or 'none'; "
             f"got {override!r}"
         )
-    return "ops_sparse" if _is_ops_sparse_available() else "torch"
+    return "torch"
+
+
+def _use_scipy_accuracy_reference():
+    """Whether the correctness reference is SciPy on CPU rather than torch.sparse.
+
+    CUDA and ROCm check against their vendor sparse library plus torch, which is
+    the pairing those two platforms have always been measured with. Every other
+    backend uses SciPy on the CPU instead, for one reason: torch.sparse there is
+    not a reference, it is another thing under test. MACA returns non-finite
+    output on the fp32 CSR path; MUSA registers no sparse matmul at all in any
+    layout or dtype. A reference that is itself broken reports the kernel as
+    wrong, which is the most expensive kind of false alarm.
+
+    Override with FLAGSPARSE_ACCURACY_REFERENCE=auto|scipy|torch -- "scipy" on a
+    CUDA box is how the SciPy path gets exercised before it ships to hardware
+    nobody here can run.
+    """
+    override = os.environ.get("FLAGSPARSE_ACCURACY_REFERENCE", "").strip().lower()
+    if override in ("scipy", "torch"):
+        return override == "scipy"
+    if override and override != "auto":
+        raise ValueError(
+            "FLAGSPARSE_ACCURACY_REFERENCE must be 'auto', 'scipy' or 'torch'; "
+            f"got {override!r}"
+        )
+    return _backend_name() not in ("cuda", "rocm")
+
+
+def _accuracy_reference_label():
+    """Banner label for whichever correctness reference is in force."""
+    return "SciPy reference" if _use_scipy_accuracy_reference() else "PyTorch reference"
+
+
+def _xpu_vendor_sparse_library():
+    """Baseline library on Kunlunxin XPU: PyTorch.
+
+    XDNN is a fixed operator set rather than a descriptor API, so there is no
+    vendor sparse library to bind -- see capi/docs/XPU.md. torch.sparse is the
+    reference that exists on the box.
+
+    Override with FLAGSPARSE_XPU_VENDOR=torch|none.
+    """
+    override = os.environ.get("FLAGSPARSE_XPU_VENDOR", "").strip().lower()
+    if override in ("torch", "none"):
+        return None if override == "none" else override
+    if override:
+        raise ValueError(
+            f"FLAGSPARSE_XPU_VENDOR must be 'torch' or 'none'; got {override!r}"
+        )
+    return "torch"
 
 
 def _vendor_sparse_library():
     """Vendor sparse library for this runtime, or None when there is none.
 
-    hipsparse (ROCm) | cupy_cusparse (CUDA, MACA) | torch (MUSA) |
-    ops_sparse (Ascend, when installed) | None
+    The measured performance baseline per backend:
+
+        CUDA      cupy_cusparse   (plus the torch reference every backend has)
+        ROCm/DCU  hipsparse       (hip-python)
+        MACA      cupy_cusparse when CuPy is installed, else torch
+        Ascend    torch
+        MUSA      None            -- muSPARSE is wired on the C API side only
+        XPU       torch
+        gcu/mlu   None            -- registered, but nothing measured there yet
+
+    CUDA is the fallthrough because it is the reference path; every other
+    backend answers for itself. A backend that falls through by accident would
+    otherwise claim CuPy/cuSPARSE on hardware that has never had it.
     """
     if _IS_ROCM_RUNTIME:
         return "hipsparse"
@@ -1016,6 +1115,10 @@ def _vendor_sparse_library():
         return _mthreads_vendor_sparse_library()
     if _IS_ASCEND_RUNTIME:
         return _ascend_vendor_sparse_library()
+    if _IS_XPU_RUNTIME:
+        return _xpu_vendor_sparse_library()
+    if _backend_name() != "cuda":
+        return None
     return "cupy_cusparse"
 
 
@@ -1027,6 +1130,9 @@ def _runtime_backend_label():
         "metax": "MetaX/MACA",
         "mthreads": "Moore Threads/MUSA",
         "ascend": "Ascend/CANN",
+        "xpu": "Kunlunxin/XPU",
+        "gcu": "Enflame/GCU",
+        "mlu": "Cambricon/MLU",
     }.get(_backend_name(), _backend_name())
 
 
@@ -1088,6 +1194,11 @@ def _backend_summary_lines(
     else:
         lines.append(f"Vendor sparse baseline: {_sparse_backend_label(vendor_backend)}")
     return lines
+
+
+def _is_cupy_available():
+    """Whether the CuPy/cuSPARSE baseline path can actually run here."""
+    return cp is not None and cpx_sparse is not None
 
 
 def _is_hipsparse_available():

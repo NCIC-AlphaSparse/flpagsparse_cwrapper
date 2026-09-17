@@ -447,14 +447,15 @@ def run_one_mtx(
     err_pt = None
     triton_ok_pt = False
     pt_error_reason = None
-    # MACA's PyTorch sparse reference is unreliable (non-finite output on the fp32 CSR
-    # path), so correctness there is checked against SciPy on the CPU instead.  Timing
-    # still uses the PyTorch path below.
-    reference_name = (
-        "SciPy reference" if ast_common._is_maca_runtime() else "PyTorch reference"
-    )
+    # Every backend except CUDA and ROCm checks correctness against SciPy on the
+    # CPU: torch.sparse there is not a reference, it is another thing under test
+    # (MACA returns non-finite output on the fp32 CSR path, MUSA registers no
+    # sparse matmul at all).  Timing still uses the PyTorch path below, so the
+    # baseline column is unaffected.
+    use_scipy_ref = ast_common._use_scipy_accuracy_reference()
+    reference_name = ast_common._accuracy_reference_label()
     try:
-        if ast_common._is_maca_runtime():
+        if use_scipy_ref:
             pt_ref_y = _scipy_spmv_reference(
                 data,
                 indices,

@@ -22,6 +22,15 @@ from pathlib import Path
 
 import pytest
 
+# These tests drive real subprocesses that import flagsparse, which imports
+# torch. The CPU-only CI runner installs tooling only (tools/ci/requirements-ci),
+# so without this they fail there rather than skip -- and nobody noticed because
+# `make ci` runs format-check first and was failing before it ever reached
+# test-ci. Machines that have torch -- dev boxes and every backend box -- still
+# run them.
+pytest.importorskip("torch", reason="tests/ci runs on a CPU-only runner without torch")
+
+
 ROOT = Path(__file__).resolve().parents[2]
 BACKENDS_DIR = ROOT / "src" / "flagsparse" / "sparse_operations" / "backends"
 
@@ -95,10 +104,9 @@ def test_backend_directories_are_empty():
         for p in BACKENDS_DIR.rglob("*.py")
         if p.name != "__init__.py"
     )
-    assert stray == [], (
-        "operator files found under backends/; overrides must be deliberate: "
-        f"{stray}"
-    )
+    # Message kept on one line on purpose: black 24.10 and ruff 0.15 wrap a
+    # multi-line assert message in opposite directions and overwrite each other.
+    assert stray == [], f"overrides under backends/ must be deliberate: {stray}"
 
 
 def test_override_shadows_shared_module(tmp_path, monkeypatch):

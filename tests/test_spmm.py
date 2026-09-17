@@ -34,6 +34,7 @@ from pathlib import Path
 import torch
 
 from benchmark_utils import ACCEL, accelerator_device
+import reference_utils
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _PROJECT_ROOT / "src"
@@ -229,6 +230,28 @@ def _apply_torch_sparse_op(sparse_matrix, B, op):
 
 
 def _build_pytorch_reference(data, indices, indptr, shape, B, op="non"):
+    """(reference, timing closure, format), with the reference per backend policy.
+
+    Only the VALUE compared against moves to SciPy on non-CUDA/ROCm backends; the
+    timing closure and its format stay exactly as the PyTorch path built them, so
+    the baseline column measures the same thing everywhere.
+    """
+    ref, timing_op, fmt = _build_torch_reference_and_timing(
+        data, indices, indptr, shape, B, op=op
+    )
+    if not fs_common._use_scipy_accuracy_reference():
+        return ref, timing_op, fmt
+
+    ref_dtype = reference_utils.reference_dtype(data.dtype)
+    matrix = reference_utils.scipy_csr(data, indices, indptr, shape, ref_dtype)
+    product = reference_utils.spmm(
+        matrix, B, ref_dtype, op=ast_ops._spmm_op_to_name(op)
+    )
+    scipy_ref = reference_utils.as_torch(product, ref_dtype, B.device)
+    return scipy_ref.to(data.dtype), timing_op, fmt
+
+
+def _build_torch_reference_and_timing(data, indices, indptr, shape, B, op="non"):
     op = ast_ops._spmm_op_to_name(op)
     if fs_common._is_maca_runtime():
         # MACA picks int32 CSR or COO per matrix (its fp32 CSR kernel is unstable with

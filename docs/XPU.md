@@ -65,6 +65,36 @@ PY
 
 ---
 
+## 1.5 跑哪些算子、拿什么做参考
+
+**跑哪些**：`--delivery-only` 让 runner 自己从 `conf/operators.yaml` 的
+`delivery_variants` 反推出该跑的算子（40 个交付变体来自 11 个父算子），不用手写 `--ops`：
+
+```bash
+python3 run_flagsparse_pytest.py --phase both --mode normal --delivery-only \
+  --benchmark-input <矩阵目录> --benchmark-warmup 5 --benchmark-iters 20
+```
+
+不给这个参数会读 yaml 的 `ops:` 清单，那是个**超集**（18 个）—— 不会漏变体，但会多跑
+7 个结果进不了 `summary.json` 的算子，在 30 个真实矩阵上是实打实的时间。
+
+**拿什么做参考**（两件不同的事，策略表见 `modified/CUDA.md`）：
+
+| | 本后端 |
+|---|---|
+| 性能 baseline（报告里与 FlagSparse 并列计时的那一列） | `torch` —— XDNN 是固定算子集不是描述符 API，没有可绑的厂商稀疏库 |
+| 精度参考（内核被比对的那个值） | **CPU 上的 SciPy** |
+
+注意与性能路径区分：五个交付算子的性能走 `benchmark/benchmark_xpu.py`，它只给
+时延和「能否执行」，不给加速比（见第 3 节）。
+
+```bash
+# 在任意后端上强制切换精度参考，用于验证另一条路径
+export FLAGSPARSE_ACCURACY_REFERENCE=auto    # auto（默认）| scipy | torch
+```
+
+---
+
 ## 2. 内核：没有 XPU 专用实现，走共享那一份
 
 `src/flagsparse/sparse_operations/` 下的算子文件里**没有任何 `_is_xpu_runtime()` 分支**
@@ -127,6 +157,20 @@ python run_flagsparse_pytest.py --phase both --mode quick --gpus 0 \
 
 ---
 
+### 单独跑那个性能脚本（排查时最有用）
+
+runner 会自动调它，但定位问题时单独跑更快 —— 它一个算子一个进程，报错不会被上层吞掉：
+
+```bash
+export PYTHONPATH=$PWD/src FLAGSPARSE_BACKEND=xpu
+python3 benchmark/benchmark_xpu.py --op spmv_csr --device 0 \
+  --csv-summary /tmp/xpu_spmv.csv --warmup 5 --iters 20
+# --matrix <file.mtx> 或 --matrix-dir <目录> 用真实矩阵；不给就用合成输入
+```
+
+CSV 的 `status` 只有两种：`PASS`（跑通了）或 `ERROR`（带 `reason`）。
+`benchmark_xpu_variants.py` 是按清单跑变体的那一层，接受 `--manifest` 与 `--matrix-dir`。
+
 ## 4. 没有厂商基线，而且不是"等一个库名"
 
 昆仑芯的数学库是 **XDNN**，提供的是**固定的稀疏算子**，不是描述符式的 generic API。
@@ -157,6 +201,22 @@ python run_flagsparse_pytest.py --phase both --mode quick --gpus 0 \
 这是被断言住的状态而不是待办。要在昆仑芯上测算子，今天的入口就是本文第 3 节的 Python 侧。
 
 ---
+
+## 5.5 排查
+
+| 现象 | 首先检查 |
+|---|---|
+| `backend` 不是 `xpu` / `accel device type` 不是 `xpu` | 厂商插件（`torch_xmlir` / `torch_xpu`）是否真的能 import。**只有 `torch.xpu` 命名空间不算** —— 上游 PyTorch 给 Intel GPU 也装它，认了就会把 Intel 卡当昆仑芯 |
+| `fallback reason` 不是 `None` | 同上；不处理的话整轮会**静默跑在 CUDA 语义下**，跑出来的不是这台机器的数 |
+| 某算子报 `TRITON_COMPILE` | 内核在 FlagTree 的 xpu target 上 lower 不出来。先用最小 Triton kernel 确认后端本身可用（参考 `MACA.md` 2.1），再看是哪个算子 |
+| 某算子报 `REJECTED` | 算子自己拒绝了输入（dtype/layout/shape），是**有意的限制**不是缺陷，看 `reason` |
+| 某算子报 `NO_ADAPTER` | 探测脚本没有这个算子的输入配方，是脚本的缺口，按 `benchmark_ascend_probe.py` 里已有的算子照着加 |
+| 性能列有数但没有加速比 | 预期行为：没有厂商稀疏库可比，见第 4 节 |
+| 精度结论可疑 | 精度参考是 CPU 上的 SciPy（见 1.5 节）。想对照 torch 的结论：`FLAGSPARSE_ACCURACY_REFERENCE=torch` 再跑一次 |
+| ctest 配置在 XPU 处停下 | 预期行为，见第 5 节。等 `deps/libtriton_jit` 出现 `cmake/BackendXPU.cmake` |
+
+跨后端通用的几条（`timeout -s KILL`、一个配置一个进程、先看 stderr、"没输出"不等于"通过"）
+展开见 `MUSA.md` 第 10 节。
 
 ## 6. 首次上机时按这个顺序走
 

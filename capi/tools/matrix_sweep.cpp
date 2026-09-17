@@ -217,7 +217,7 @@ mm::Csr lower_triangle(const mm::Csr& A) {
         }
         // The diagonal must come FIRST in storage order? No -- ascending columns
         // put it last for a lower row, which is what the scan expects. Move it.
-        std::rotate(L.indices.begin() + static_cast<long>(diag_slot), 
+        std::rotate(L.indices.begin() + static_cast<long>(diag_slot),
                     L.indices.begin() + static_cast<long>(diag_slot) + 1,
                     L.indices.end());
         std::rotate(L.values.begin() + static_cast<long>(diag_slot),

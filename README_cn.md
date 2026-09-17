@@ -44,9 +44,9 @@ FlagSparse 按检测到的运行时对**厂商参考实现与基线**进行分�
 | --- | --- | --- | --- |
 | NVIDIA CUDA | `torch.version.hip is None` | cuSPARSE | CuPy（`cupy-cuda12x`） |
 | DCU / ROCm | `torch.version.hip is not None` | hipSPARSE | `hip-python` |
-| MetaX / MACA（C550） | 见 `_detect_maca_runtime()` | 暂用 CuPy/cuSPARSE 兼容路径 | CuPy |
+| MetaX / MACA（C550） | 见 `_detect_maca_runtime()` | CuPy 真装了就用，否则 `torch` —— **探测而非假定**：做 bring-up 的那台 C550 没有 CuPy | CuPy |
 | 摩尔线程 / MUSA | `torch.musa` 可用 | **默认无** —— 那里 `torch.sparse` 能建 CSR/COO 张量但没注册 sparse matmul，MTT S5000 实测 | torch_musa |
-| 昇腾 / CANN（910B） | `torch.npu` 可用 | **ops-sparse**，缺失时回落 `torch.sparse` | torch_npu |
+| 昇腾 / CANN（910B） | `torch.npu` 可用 | **`torch`** —— ops-sparse 仍可用环境变量选回做 A/B | torch_npu |
 | 昆仑芯 XPU | 厂商插件可 import（`torch_xmlir` / `torch_xpu`） | **无** —— XDNN 是固定算子集而非描述符 API，没有可绑的通用入口 | torch_xmlir |
 | 燧原 GCU | `torch_gcu` 可 import | 暂无 | torch_gcu |
 | 寒武纪 MLU | **只能由环境变量选中**，从不自动探测：它是通用备用槽位，没有自己条目的厂商可以从这里走 | 暂无 | torch_mlu |
@@ -76,7 +76,13 @@ export FLAGSPARSE_MACA_VENDOR=none  # CuPy 不可用时跳过厂商基线
 
 # 摩尔线程 / 昇腾的基线选择
 export FLAGSPARSE_MTHREADS_VENDOR=none       # none（默认）| torch | musparse
-export FLAGSPARSE_ASCEND_VENDOR=ops_sparse   # ops_sparse | torch | none
+export FLAGSPARSE_ASCEND_VENDOR=torch        # torch（默认）| ops_sparse | none
+export FLAGSPARSE_XPU_VENDOR=torch           # torch（默认）| none
+
+# 正确性参考。CUDA 与 ROCm 比对各自的厂商库加 torch；其余后端一律比对 CPU 上的 SciPy ——
+# 那些平台上的 torch.sparse 本身就是被测对象，不是参考。在 CUDA 机器上强制 "scipy"，
+# 是这条路径在送到没人能跑的硬件之前唯一的验证办法。
+export FLAGSPARSE_ACCURACY_REFERENCE=auto    # auto（默认）| scipy | torch
 ```
 
 调优参数按型号分档，在 `spmv_csr.py` 的 `_MACA_SPMV_PROFILES` 和 `spsv.py` 的

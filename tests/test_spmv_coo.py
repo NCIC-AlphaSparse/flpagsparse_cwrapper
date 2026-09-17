@@ -24,6 +24,7 @@ import time
 import torch
 
 from benchmark_utils import ACCEL, accelerator_device
+import reference_utils
 import sys
 from pathlib import Path
 
@@ -219,6 +220,31 @@ def _pytorch_coo_reference(data, row, col, x, shape, out_dtype, op="non"):
     ).coalesce()
     y_ref = torch.sparse.mm(coo_ref, x_ref.unsqueeze(1)).squeeze(1)
     return y_ref.to(out_dtype) if ref_dtype != out_dtype else y_ref
+
+
+def _scipy_coo_reference(data, row, col, x, shape, out_dtype, op="non"):
+    """Same value as _pytorch_coo_reference, computed on CPU with SciPy."""
+    data, row, col, shape = _apply_coo_op(data, row, col, shape, op)
+    ref_dtype = _reference_dtype(out_dtype)
+    matrix = reference_utils.scipy_coo(data, row, col, shape, ref_dtype)
+    product = reference_utils.spmv(matrix, x, ref_dtype)
+    y_ref = reference_utils.as_torch(product, ref_dtype, data.device)
+    return y_ref.to(out_dtype) if ref_dtype != out_dtype else y_ref
+
+
+def _correctness_reference(data, row, col, x, shape, out_dtype, op="non"):
+    """The value the kernel is compared against, per backend policy.
+
+    This is NOT the PyTorch baseline column: that one keeps calling
+    _pytorch_coo_reference directly, because it is the thing being measured
+    rather than the thing being trusted.
+    """
+    builder = (
+        _scipy_coo_reference
+        if fs_common._use_scipy_accuracy_reference()
+        else _pytorch_coo_reference
+    )
+    return builder(data, row, col, x, shape, out_dtype, op=op)
 
 
 def _dense_to_coo(A):
@@ -562,7 +588,7 @@ def _run_one_coo_case(
     )
     y_base = base["out"]
     y_opt = opt["out"]
-    y_ref = _pytorch_coo_reference(data, row, col, x, shape, dtype, op=op)
+    y_ref = _correctness_reference(data, row, col, x, shape, dtype, op=op)
     err_base = _allclose_error_ratio(y_base, y_ref, atol, rtol)
     err_opt = _allclose_error_ratio(y_opt, y_ref, atol, rtol)
     err_pt = None
@@ -666,7 +692,7 @@ def _run_one_tocsr_case(
         warmup,
         iters,
     )
-    y_ref = _pytorch_coo_reference(data, row, col, x, shape, dtype, op="non")
+    y_ref = _correctness_reference(data, row, col, x, shape, dtype, op="non")
     err_runtime = _allclose_error_ratio(y_runtime, y_ref, atol, rtol)
     err_prepared = _allclose_error_ratio(y_prepared, y_ref, atol, rtol)
     pt_ms = _time_pytorch_coo(data, row, col, x, shape, "non", warmup, iters)

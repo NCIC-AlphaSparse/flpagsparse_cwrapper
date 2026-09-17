@@ -20,6 +20,36 @@ python -c "import flagsparse.sparse_operations._common as C; print(C._backend_na
 
 ---
 
+## 0.5 跑哪些算子、拿什么做参考
+
+**跑哪些**：`--delivery-only` 让 runner 自己从 `conf/operators.yaml` 的
+`delivery_variants` 反推出该跑的算子（40 个交付变体来自 11 个父算子），不用手写 `--ops`：
+
+```bash
+python3 run_flagsparse_pytest.py --phase both --mode normal --delivery-only \
+  --benchmark-input <矩阵目录> --benchmark-warmup 5 --benchmark-iters 20
+```
+
+不给这个参数会读 yaml 的 `ops:` 清单，那是个**超集**（18 个）—— 不会漏变体，但会多跑
+7 个结果进不了 `summary.json` 的算子，在 30 个真实矩阵上是实打实的时间。
+
+**拿什么做参考**（两件不同的事，策略表见 `modified/CUDA.md`）：
+
+| | 本后端 |
+|---|---|
+| 性能 baseline（报告里与 FlagSparse 并列计时的那一列） | **无**（Python 侧）—— muSPARSE 基线在 C API 侧，见 `capi/docs/MUSA.md` |
+| 精度参考（内核被比对的那个值） | **CPU 上的 SciPy** |
+
+两者都不用 torch.sparse，理由同一个且是实测的：MUSA 上 `torch.sparse` 能建
+CSR/COO 张量但**没注册 sparse matmul**，四个 dtype 全挂（见第 3 节）。
+
+```bash
+# 在任意后端上强制切换精度参考，用于验证另一条路径
+export FLAGSPARSE_ACCURACY_REFERENCE=auto    # auto（默认）| scipy | torch
+```
+
+---
+
 ## 1. MUSA 与 CUDA 兼容后端的区别
 
 这一点决定了后面所有设置，值得先说清楚。

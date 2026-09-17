@@ -36,6 +36,7 @@ from pathlib import Path
 import torch
 
 from benchmark_utils import ACCEL, accelerator_device
+import reference_utils
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _PROJECT_ROOT / "src"
@@ -237,7 +238,17 @@ def _benchmark_reference_sddmm(
     ref_values, ref_ms = ast_ops._benchmark_cuda_op(
         timing_op, warmup=warmup, iters=iters
     )
-    if value_dtype == torch.float32:
+    if fs_common._use_scipy_accuracy_reference():
+        # Same formula as _sddmm_reference, evaluated off the accelerator: the
+        # sampled dot is where a half-working vendor dense library shows up as a
+        # "wrong" kernel.  Timing above is untouched.
+        ref_dtype = reference_utils.reference_dtype(value_dtype)
+        sampled = reference_utils.sddmm_csr_values(indices, indptr64, x, y, ref_dtype)
+        vals = reference_utils.as_torch(sampled, ref_dtype, x.device) * alpha
+        if data is not None:
+            vals = vals + beta * data.to(ref_dtype)
+        ref_values = vals.to(value_dtype)
+    elif value_dtype == torch.float32:
         x_ref = x.to(torch.float64)
         y_ref = y.to(torch.float64)
         data_ref = data.to(torch.float64) if data is not None else None

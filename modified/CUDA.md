@@ -32,6 +32,26 @@ tests/pytest    1613 passed / 3 failed   （3 个是既有失败，与后端改�
 ## 唯一一类"CUDA 侧改动"
 
 不是后端适配，而是**所有后端共用的东西在 CUDA 上改**：加速器抽象（`_ACCEL`）、
-交付变体投影、结果格式。这类改动要反过来证明它在**其他后端**上也成立 —— 举证责任在
-改动者，不在各后端。它们不属于任何一个后端的台账，写在被改模块自己的注释和
-`docs/` 里。
+交付变体投影、结果格式、**各后端 baseline 的选择策略**。这类改动要反过来证明它在
+**其他后端**上也成立 —— 举证责任在改动者，不在各后端。它们不属于任何一个后端的台账，
+写在被改模块自己的注释和 `docs/` 里。
+
+### baseline 策略（2026-09-16 定）
+
+| 后端 | 性能 baseline | 精度参考 |
+|---|---|---|
+| CUDA | `cupy_cusparse` | PyTorch（+ 厂商列） |
+| DCU/ROCm | `hipsparse` | PyTorch（+ 厂商列） |
+| MACA | CuPy 装了就用，否则 `torch` | **SciPy (CPU)** |
+| MUSA | 无（muSPARSE 在 C API 侧） | **SciPy (CPU)** |
+| Ascend | `torch` | **SciPy (CPU)** |
+| XPU | `torch` | **SciPy (CPU)** |
+| gcu / mlu | 无 | **SciPy (CPU)** |
+
+判据在 `_common._vendor_sparse_library()` 与 `_common._use_scipy_accuracy_reference()`，
+由 `tests/ci/test_backend_baseline_policy.py` 钉住。**精度参考换成 SciPy 的理由不是偏好**：
+那些平台上的 torch.sparse 本身就是被测对象 —— MACA 在 fp32 CSR 路径上返回非有限值，
+MUSA 根本没注册 sparse matmul。参考自己是坏的，会把内核报成错的，那是代价最高的一类误报。
+
+**计时不受影响**：PyTorch baseline 列照旧在加速器上测，只有"被比对的那个值"挪到 CPU。
+共享的 SciPy 参考核在 `tests/reference_utils.py`，8 个 benchmark 脚本共用。

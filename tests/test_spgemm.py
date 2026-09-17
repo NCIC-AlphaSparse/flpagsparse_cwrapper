@@ -32,6 +32,7 @@ from pathlib import Path
 import torch
 
 from benchmark_utils import ACCEL, accelerator_device
+import reference_utils
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _PROJECT_ROOT / "src"
@@ -405,6 +406,38 @@ def _build_spgemm_rhs(a_data, a_indices, a_indptr, a_shape, mode):
     # CSR^T may materialize as CSC; convert through COO so downstream always receives CSR.
     b_t = a_t.transpose(0, 1).to_sparse_coo().coalesce()
     return ast_ops._torch_sparse_to_csr(b_t)
+
+
+def _build_scipy_spgemm_reference(
+    a_data,
+    a_indices,
+    a_indptr,
+    a_shape,
+    b_data,
+    b_indices,
+    b_indptr,
+    b_shape,
+):
+    """C = A @ B on CPU with SciPy, in the same (data, indices, indptr, shape) form.
+
+    Index widths follow _torch_sparse_to_csr -- int32 columns, int64 row pointers
+    -- so the comparison downstream comes out of the same shape of object no
+    matter which reference produced it.
+    """
+    ref_dtype = reference_utils.reference_dtype(a_data.dtype)
+    a_csr = reference_utils.scipy_csr(a_data, a_indices, a_indptr, a_shape, ref_dtype)
+    b_csr = reference_utils.scipy_csr(b_data, b_indices, b_indptr, b_shape, ref_dtype)
+    product = reference_utils.spgemm(a_csr, b_csr)
+    product.sort_indices()
+    device = a_data.device
+    data = reference_utils.as_torch(product.data, ref_dtype, device).to(a_data.dtype)
+    indices = torch.as_tensor(
+        product.indices, dtype=torch.int32, device=device
+    ).contiguous()
+    indptr = torch.as_tensor(
+        product.indptr, dtype=torch.int64, device=device
+    ).contiguous()
+    return data, indices, indptr, (int(a_shape[0]), int(b_shape[1]))
 
 
 def _build_torch_spgemm_reference(
@@ -1264,6 +1297,19 @@ def run_one_mtx(
         pt_ref_result = pt_ref.get("result")
         result["pytorch_format"] = pt_ref.get("format")
         result["pytorch_ms"] = pt_ref.get("ms")
+        if ast_common._use_scipy_accuracy_reference():
+            # Correctness moves to SciPy on CPU; pytorch_ms just above stays the
+            # measured PyTorch baseline, so the column keeps meaning what it did.
+            pt_ref_result = _build_scipy_spgemm_reference(
+                a_data,
+                a_indices,
+                a_indptr,
+                a_shape,
+                b_data,
+                b_indices,
+                b_indptr,
+                b_shape,
+            )
     else:
         result["pytorch_reason"] = pt_ref.get("reason")
         result["ref_fail_stage"] = pt_ref.get("fail_stage")

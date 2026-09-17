@@ -29,9 +29,9 @@ runtime; the Triton kernels themselves are unchanged across backends.
 | --- | --- | --- | --- |
 | NVIDIA CUDA | `torch.version.hip is None` | cuSPARSE | CuPy (`cupy-cuda12x`) |
 | DCU / ROCm | `torch.version.hip is not None` | hipSPARSE | `hip-python` |
-| MetaX / MACA (C550) | see `_detect_maca_runtime()` | CuPy/cuSPARSE-compatible (provisional) | CuPy |
+| MetaX / MACA (C550) | see `_detect_maca_runtime()` | CuPy when it is really installed, else `torch` -- **probed, not assumed**: the C550 this was brought up on has none | CuPy |
 | Moore Threads / MUSA | `torch.musa` available | **none by default** -- `torch.sparse` builds CSR/COO tensors there but registers no sparse matmul, measured on MTT S5000 | torch_musa |
-| Ascend / CANN (910B) | `torch.npu` available | **ops-sparse**, falls back to `torch.sparse` | torch_npu |
+| Ascend / CANN (910B) | `torch.npu` available | **`torch`** -- ops-sparse stays one env var away for a vendor A/B | torch_npu |
 | Kunlunxin XPU | vendor plugin importable (`torch_xmlir` / `torch_xpu`) | **none** -- XDNN is a fixed operator set, not a descriptor API, so there is nothing to bind | torch_xmlir |
 | Enflame GCU | `torch_gcu` importable | none yet | torch_gcu |
 | Cambricon MLU | **env-routed only**, never auto-detected: it is the generic reserve slot, so a vendor with no entry of its own can be driven through it | none yet | torch_mlu |
@@ -64,7 +64,14 @@ export FLAGSPARSE_MACA_VENDOR=none  # skip the vendor baseline if CuPy is unusab
 
 # Baseline choice for Moore Threads / Ascend
 export FLAGSPARSE_MTHREADS_VENDOR=none       # none (default) | torch | musparse
-export FLAGSPARSE_ASCEND_VENDOR=ops_sparse   # ops_sparse | torch | none
+export FLAGSPARSE_ASCEND_VENDOR=torch        # torch (default) | ops_sparse | none
+export FLAGSPARSE_XPU_VENDOR=torch           # torch (default) | none
+
+# Correctness reference. CUDA and ROCm compare against their vendor library plus
+# torch; every other backend compares against SciPy on CPU, because torch.sparse
+# there is another thing under test rather than a reference. Forcing "scipy" on a
+# CUDA box is how that path gets exercised before it ships.
+export FLAGSPARSE_ACCURACY_REFERENCE=auto    # auto (default) | scipy | torch
 ```
 
 Tuning is per model, in `_MACA_SPMV_PROFILES` (`spmv_csr.py`) and `_MACA_SPSV_PROFILES`

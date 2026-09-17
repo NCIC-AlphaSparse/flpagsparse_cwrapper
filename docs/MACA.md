@@ -37,6 +37,36 @@ FlagSparse 按运行时分发**厂商参考实现/基线**和**少数按后端�
 
 ---
 
+## 0.5 跑哪些算子、拿什么做参考
+
+**跑哪些**：`--delivery-only` 让 runner 自己从 `conf/operators.yaml` 的
+`delivery_variants` 反推出该跑的算子（40 个交付变体来自 11 个父算子），不用手写 `--ops`：
+
+```bash
+python3 run_flagsparse_pytest.py --phase both --mode normal --delivery-only \
+  --benchmark-input <矩阵目录> --benchmark-warmup 5 --benchmark-iters 20
+```
+
+不给这个参数会读 yaml 的 `ops:` 清单，那是个**超集**（18 个）—— 不会漏变体，但会多跑
+7 个结果进不了 `summary.json` 的算子，在 30 个真实矩阵上是实打实的时间。
+
+**拿什么做参考**（两件不同的事，策略表见 `modified/CUDA.md`）：
+
+| | 本后端 |
+|---|---|
+| 性能 baseline（报告里与 FlagSparse 并列计时的那一列） | CuPy **真装了**就用 `cupy_cusparse`，否则 `torch` —— 探测而非假定 |
+| 精度参考（内核被比对的那个值） | **CPU 上的 SciPy** |
+
+这台 C550 没有 CuPy，所以实际是 PyTorch 计时 + SciPy 参考。精度不走 torch.sparse
+是有实测原因的：MACA 的 fp32 CSR 路径会返回非有限值，拿它当参考会把好内核报成错的。
+
+```bash
+# 在任意后端上强制切换精度参考，用于验证另一条路径
+export FLAGSPARSE_ACCURACY_REFERENCE=auto    # auto（默认）| scipy | torch
+```
+
+---
+
 ## 1. 每次开工的四行
 
 ```bash
@@ -179,7 +209,7 @@ python -c "import cupy, cupyx.scipy.sparse as s; print(cupy.__version__); print(
 不可用就关掉 —— 基线列会变 `N/A`，但**算子照常运行**，正确性仍由 `torch.sparse` 校验：
 
 ```bash
-export FLAGSPARSE_MACA_VENDOR=none    # cupy_cusparse | none
+export FLAGSPARSE_MACA_VENDOR=none    # torch（本机默认，因为没装 CuPy）| cupy_cusparse | none
 ```
 
 > 与 DCU 不同，MetaX 目前**没有**接原生厂商稀疏库（DCU 接的是 hipSPARSE）。

@@ -27,3 +27,8 @@ test_spmv_bsr_scipy.csv
 # rocSPARSE VMFault (SIGABRT, uncatchable) leaves behind which one triggered it.
 # Deleted on a clean finish, so its presence means the last run died.
 *.inflight.json
+
+# Editor settings. `.vscode/settings.json` was committed by accident in the
+# first commit and carried one developer's absolute path, which is useless to
+# everyone else and churns on every machine.
+.vscode/

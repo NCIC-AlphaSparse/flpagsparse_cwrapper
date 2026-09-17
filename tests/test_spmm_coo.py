@@ -33,6 +33,7 @@ from pathlib import Path
 import torch
 
 from benchmark_utils import ACCEL, accelerator_device
+import reference_utils
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _PROJECT_ROOT / "src"
@@ -544,6 +545,43 @@ def _prepare_canonical_case(data, row, col, shape, B, op="non", layout="row"):
 
 
 def _build_pytorch_reference(
+    data, row, col, shape, B, prepared=None, op="non", layout="row"
+):
+    """(reference, timing closure, format, reason), reference per backend policy.
+
+    The canonical arrays already have `op` and the layout folded in, so the SciPy
+    reference is a plain A @ B over them -- no second chance to get the operand
+    form wrong. The timing closure is untouched: the PyTorch baseline column
+    still measures torch.sparse on the accelerator.
+    """
+    prepared = (
+        _prepare_canonical_case(data, row, col, shape, B, op=op, layout=layout)
+        if prepared is None
+        else prepared
+    )
+    expected, pytorch_op, fmt, reason = _build_torch_reference_and_timing(
+        data, row, col, shape, B, prepared=prepared, op=op, layout=layout
+    )
+    if not fs_common._use_scipy_accuracy_reference():
+        return expected, pytorch_op, fmt, reason
+
+    out_dtype = prepared["output_dtype"]
+    ref_dtype = reference_utils.reference_dtype(out_dtype)
+    matrix = reference_utils.scipy_coo(
+        prepared["canonical_data"],
+        prepared["canonical_row"],
+        prepared["canonical_col"],
+        (prepared["n_rows"], prepared["n_cols"]),
+        ref_dtype,
+    )
+    product = reference_utils.spmm(matrix, prepared["canonical_B"], ref_dtype)
+    scipy_ref = reference_utils.as_torch(
+        product, ref_dtype, prepared["canonical_B"].device
+    )
+    return scipy_ref.to(out_dtype), pytorch_op, fmt, reason
+
+
+def _build_torch_reference_and_timing(
     data, row, col, shape, B, prepared=None, op="non", layout="row"
 ):
     prepared = (

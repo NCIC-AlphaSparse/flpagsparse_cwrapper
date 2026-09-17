@@ -23,6 +23,35 @@ Triton 内核在两个后端是同一份代码，**只有"厂商参考实现/基
 
 ---
 
+## 0.5 跑哪些算子、拿什么做参考
+
+**跑哪些**：`--delivery-only` 让 runner 自己从 `conf/operators.yaml` 的
+`delivery_variants` 反推出该跑的算子（40 个交付变体来自 11 个父算子），不用手写 `--ops`：
+
+```bash
+python3 run_flagsparse_pytest.py --phase both --mode normal --delivery-only \
+  --benchmark-input <矩阵目录> --benchmark-warmup 5 --benchmark-iters 20
+```
+
+不给这个参数会读 yaml 的 `ops:` 清单，那是个**超集**（18 个）—— 不会漏变体，但会多跑
+7 个结果进不了 `summary.json` 的算子，在 30 个真实矩阵上是实打实的时间。
+
+**拿什么做参考**（两件不同的事，策略表见 `modified/CUDA.md`）：
+
+| | 本后端 |
+|---|---|
+| 性能 baseline（报告里与 FlagSparse 并列计时的那一列） | `hipsparse`（hip-python） |
+| 精度参考（内核被比对的那个值） | **PyTorch** —— DCU 与 CUDA 是仅有的两个比对厂商库加 torch 的后端 |
+
+覆盖范围（哪些算子有 hipSPARSE 基线、哪些没有）见 4.5 节。
+
+```bash
+# 在任意后端上强制切换精度参考，用于验证另一条路径
+export FLAGSPARSE_ACCURACY_REFERENCE=auto    # auto（默认）| scipy | torch
+```
+
+---
+
 ## 1. 环境准备
 
 ```bash
