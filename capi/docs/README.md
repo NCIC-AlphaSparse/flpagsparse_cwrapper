@@ -323,6 +323,20 @@ HTML 没有复用 `run_flagsparse_pytest.py:2994` 的生成器，原因有两条
 `check_manifest.py` 会把清单与实现之间的每一处不一致列出来。这个机制建立之前，两者漂了
 **34 处**没有任何东西发现。
 
+### 测了、过了，但没有厂商基线：`NoBaseline`
+
+`summary.json` 里 `performance.status` 的取值：
+
+| 状态 | 含义 |
+|---|---|
+| `Passed` | 有加速比（基线可用、答案通过） |
+| **`NoBaseline`** | 内核每一行都跑了、精度都过了，只是厂商库没有这个 dtype/算子可比，算不出加速比。`data.<dtype>.reason` 写着厂商库给的原因，比如 `muSPARSE: Gather dtype unsupported` |
+| `Skipped` | 真的没跑出结果（没有 `status: ok` 的行） |
+| `NotFound` | 登记了但这次没测到 |
+
+`NoBaseline` 是 2026-09-18 加的。之前这种情况被归成 `Skipped`：MUSA 上 gather/scatter f16 各 30 个矩阵
+都有实测耗时，报告却显示"没跑"（`modified/MUSA.md` 第 13 节）。它**不算失败**，也不计入加速比均值。
+
 ## 厂商基线与加速比
 
 加速比的分母必须是**用户本来会调的那个库**，否则这个数没有意义。所以基线是厂商自己的

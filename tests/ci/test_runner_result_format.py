@@ -667,3 +667,34 @@ def test_parse_op_benchmark_args_keeps_arguments_scoped_to_each_operator():
 def test_parse_op_benchmark_args_rejects_invalid_values(value):
     with pytest.raises(ValueError, match="op-benchmark-args"):
         runner.parse_op_benchmark_args([value])
+
+
+def test_html_speedups_use_the_variant_data_and_have_an_fp64_column():
+    # A delivery-variant row carries its own `data` next to the operator-wide
+    # `records`/`speedup`. The HTML used to miss the short dtype keys, fall back
+    # to the operator's records, and print the operator's speedup in the first
+    # column -- so f32 and f64 rows showed identical, mixed numbers.
+    assert "fp64" in [display for display, _ in runner.HTML_SPEEDUP_DTYPES]
+    performance = {
+        "speedup": 13.0,
+        "data": {"fp64": {"speedup": 2.0, "details": {}}},
+        "records": [
+            {"value_dtype": "float32", "triton_speedup_vs_pytorch": "9.0"},
+            {"value_dtype": "complex64", "triton_speedup_vs_pytorch": "7.0"},
+        ],
+    }
+    overall, by_dtype = runner._performance_speedups_for_html(performance)
+    assert by_dtype == {"fp64": 2.0}
+    assert overall == 2.0
+
+
+def test_operator_speedup_prefers_the_vendor_column(tmp_path):
+    csv_path = tmp_path / "performance.csv"
+    csv_path.write_text(
+        "matrix,value_dtype,triton_ms,cusparse_ms,pytorch_ms,"
+        "triton_speedup_vs_cusparse,triton_speedup_vs_pytorch,status\n"
+        "a.mtx,float32,1.0,2.0,9.0,2.0,9.0,PASS\n",
+        encoding="utf-8",
+    )
+    summary = runner.summarize_performance_csv(csv_path)
+    assert summary["speedup"] == 2.0

@@ -108,6 +108,9 @@ STATUS_TO_FLAGGEMS = {
     "Timeout": "Timeout",
     "NotFound": "NotFound",
     "Error": "Error",
+    # Kernel ran and passed, but no vendor baseline exists for this dtype.
+    # Emitted by capi/tools/write_summary.py; kept here so the two tables match.
+    "NoBaseline": "NoBaseline",
 }
 PYTEST_STATUS_TO_FLAGGEMS = {
     "PASSED": "Passed",
@@ -2233,7 +2236,10 @@ def summarize_performance_csv(
         }
         summary["speedup_by_column"] = by_column
         if "speedup" not in summary:
-            preferred = [
+            # Vendor-first, same order as the per-row choice: this list used to
+            # put triton_speedup_vs_pytorch first, so the operator-level number
+            # was against PyTorch even where every row had a cuSPARSE baseline.
+            preferred = [key for key, _, _ in PERFORMANCE_SPEEDUP_SCHEMAS] + [
                 "speedup",
                 "triton_speedup_vs_pytorch",
                 "opt_speedup_vs_pytorch",
@@ -3141,10 +3147,15 @@ function sortTable(col, dir) {
 </script>"""
 
 
+# The short spellings (fp16/fp32/fp64/bf16) are what _flaggems_perf_data keys
+# `data` by, so without them a variant's own numbers matched no column and the
+# row fell back to operator-wide records -- f32 and f64 rows showed the same
+# mixed values, and there was no fp64 column at all for the f64 variants.
 HTML_SPEEDUP_DTYPES = (
-    ("fp16", ("float16", "torch.float16", "half")),
-    ("fp32", ("float32", "torch.float32", "float")),
-    ("bf16", ("bfloat16", "torch.bfloat16")),
+    ("fp16", ("float16", "torch.float16", "half", "fp16")),
+    ("fp32", ("float32", "torch.float32", "float", "fp32")),
+    ("fp64", ("float64", "torch.float64", "double", "fp64")),
+    ("bf16", ("bfloat16", "torch.bfloat16", "bf16")),
     ("int16", ("int16", "torch.int16")),
     ("int32", ("int32", "torch.int32")),
     ("int8", ("int8", "torch.int8")),
@@ -3291,6 +3302,15 @@ def _performance_speedups_for_html(
             number = _to_float(dtype_data.get("speedup"))
             if number is not None:
                 by_dtype.setdefault(bucket, []).append(number)
+
+    # A delivery-variant row carries its own `data`, but the phase-level
+    # "speedup" next to it is the whole operator's. Average what this row
+    # actually shows instead of printing the operator's number beside it.
+    if by_dtype:
+        values = [value for values in by_dtype.values() for value in values]
+        return statistics.mean(values), {
+            dtype: statistics.mean(vals) for dtype, vals in by_dtype.items()
+        }
 
     if not by_dtype:
         records = phase_result.get("records")

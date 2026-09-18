@@ -213,7 +213,9 @@ def merge_summaries(py_summary_path: Path, capi_summary_path: Path, out_path: Pa
     total = len(merged_result)
     acc_pass = sum(1 for e in merged_result.values() if e.get("accuracy", {}).get("status") == "Passed")
     perf_pass = sum(1 for e in merged_result.values() if e.get("performance", {}).get("status") == "Passed")
-    log(f"wrote {out_path}: {total} variants, accuracy Passed={acc_pass}, performance Passed={perf_pass}")
+    perf_nobase = sum(1 for e in merged_result.values() if e.get("performance", {}).get("status") == "NoBaseline")
+    log(f"wrote {out_path}: {total} variants, accuracy Passed={acc_pass}, performance Passed={perf_pass}, "
+        f"NoBaseline={perf_nobase} (ran and passed, no vendor baseline to compare)")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

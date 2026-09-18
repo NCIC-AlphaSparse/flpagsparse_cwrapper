@@ -34,6 +34,7 @@ STATUS_CLASS = {
     "Timeout": "bad",
     "Error": "bad",
     "NotFound": "skip",
+    "NoBaseline": "skip",
     "Unknown": "skip",
 }
 

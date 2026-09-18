@@ -64,6 +64,7 @@ STATUS_TO_FLAGGEMS = {
     "Timeout": "Timeout",
     "NotFound": "NotFound",
     "Error": "Error",
+    "NoBaseline": "NoBaseline",
 }
 
 # The C tests tag dtypes by component width (c32 = complex<float>); FlagGems
@@ -275,7 +276,7 @@ def main():
             ]
 
             dt = flag_gems_dtype(vrows[0].get("dtype", "?"))
-            det, sp = {}, []
+            det, sp, no_base = {}, [], []
             for r in vrows:
                 if r.get("status") != "ok":
                     continue
@@ -286,6 +287,35 @@ def main():
                 }
                 if r.get("speedup"):
                     sp.append(float(r["speedup"]))
+                elif r.get("baseline_status") != "ok" and r.get("accuracy") in (
+                    "pass",
+                    "pass_relaxed",
+                ):
+                    no_base.append(r)
+
+            # NoBaseline: the kernel ran and passed on EVERY measured row, only the
+            # vendor library had nothing to compare against (e.g. muSPARSE has no
+            # fp16 gather/scatter). This used to fall through to "Skipped", which
+            # reads as "not run" -- the MUSA f16 rows had 30 real timings each.
+            ok_rows = [r for r in vrows if r.get("status") == "ok"]
+            no_baseline = not sp and bool(ok_rows) and len(no_base) == len(ok_rows)
+            perf_status = (
+                "Passed" if sp else ("NoBaseline" if no_baseline else "Skipped")
+            )
+            dt_data = {
+                "result": "Passed"
+                if sp
+                else ("NoBaseline" if no_baseline else "Unknown"),
+                "details": det,
+                "speedup": sum(sp) / len(sp) if sp else 0.0,
+            }
+            if no_baseline:
+                dt_data["reason"] = sorted(
+                    {
+                        str(r.get("baseline_detail") or r.get("baseline_status"))
+                        for r in no_base
+                    }
+                )
 
             v_details = {}
             if v_failed:
@@ -316,14 +346,8 @@ def main():
                     "duration": 0.0,
                     "exit_code": 0,
                     "data_file": path.name,
-                    "data": {
-                        dt: {
-                            "result": "Passed" if sp else "Unknown",
-                            "details": det,
-                            "speedup": sum(sp) / len(sp) if sp else 0.0,
-                        }
-                    },
-                    "status": flaggems_status("Passed" if sp else "Skipped"),
+                    "data": {dt: dt_data},
+                    "status": flaggems_status(perf_status),
                     "test_case": "matrix",
                 },
                 "labels": ["flagsparse", "c_api"],
