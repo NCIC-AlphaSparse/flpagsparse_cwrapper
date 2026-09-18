@@ -20,28 +20,60 @@ python -c "import flagsparse.sparse_operations._common as C; print(C._backend_na
 
 ---
 
-## 0.5 跑哪些算子、拿什么做参考
+## 0.5 交付复现：40 个变体 × 30 个矩阵（精度 + 性能）
 
-**跑哪些**：`--delivery-only` 让 runner 自己从 `conf/operators.yaml` 的
-`delivery_variants` 反推出该跑的算子（40 个交付变体来自 11 个父算子），不用手写 `--ops`：
+**MUSA 用 `run_flagsparse_split_delivery.py`，不用 `run_flagsparse_pytest.py --phase both`。**
+Python 侧在 MUSA 上没有厂商稀疏库（第 3 节），性能阶段只有 FlagSparse 自己的耗时、没有加速比；
+muSPARSE 基线在 C API 侧。这个 runner 精度取 pytest（SciPy 参考），性能取 C API 的 `ctest -R benchmark`
+（对 muSPARSE），合成一份 `summary_split.json`。
+
+**环境**：
 
 ```bash
-python3 run_flagsparse_pytest.py --phase both --mode normal --delivery-only \
-  --benchmark-input <矩阵目录> --benchmark-warmup 5 --benchmark-iters 20
+export PYTHONPATH=$PWD/src FLAGSPARSE_BACKEND=mthreads MUSA_HOME=/usr/local/musa
+python3 -c "from flagsparse.sparse_operations import _common as c; print(c._backend_name(), c._accel_device_type(), c._accel_fallback_reason())"
+# 期望：mthreads musa None
+mthreads-gmi                          # 单卡；跑之前确认没有别的任务在用 GPU
 ```
 
-不给这个参数会读 yaml 的 `ops:` 清单，那是个**超集**（18 个）—— 不会漏变体，但会多跑
-7 个结果进不了 `summary.json` 的算子，在 30 个真实矩阵上是实打实的时间。
+**命令**：
 
-**拿什么做参考**（两件不同的事，策略表见 `modified/CUDA.md`）：
+```bash
+setsid timeout -s KILL 43200 python3 -u run_flagsparse_split_delivery.py \
+  --mode normal --benchmark-input /root/gcx/matrix --timeout 3600 \
+  --results-dir pytest_results_mthreads_split \
+  > pytest_results_mthreads_split.log 2>&1 < /dev/null &
+```
+
+`--timeout` 同时传给 pytest 的每个算子阶段和 C API 的 CTest（`-DFLAGSPARSE_CTEST_TIMEOUT`）。
+首次运行会从零构建 C API（`capi/build`），配置日志里应当出现
+`ctest baseline: MUSA -> /usr/local/musa/lib/libmusparse.so`；已经构建过可加 `--skip-capi-build`。
+
+**参考**：
 
 | | 本后端 |
 |---|---|
-| 性能 baseline（报告里与 FlagSparse 并列计时的那一列） | **无**（Python 侧）—— muSPARSE 基线在 C API 侧，见 `capi/docs/MUSA.md` |
-| 精度参考（内核被比对的那个值） | **CPU 上的 SciPy** |
+| 性能 baseline | **muSPARSE**（C API 侧，`capi/docs/MUSA.md`）；Python 侧没有 |
+| 精度参考 | **CPU 上的 SciPy** —— MUSA 上 `torch.sparse` 能建 CSR/COO 张量但**没注册 sparse matmul** |
 
-两者都不用 torch.sparse，理由同一个且是实测的：MUSA 上 `torch.sparse` 能建
-CSR/COO 张量但**没注册 sparse matmul**，四个 dtype 全挂（见第 3 节）。
+**预期会看到的非 Passed**（2026-09-18 在 MTT S5000 上实测，`modified/MUSA.md` 第 13 节）：
+
+- 精度 40/40 Passed；
+- 性能 `gather_f16_int`、`scatter_f16_int` 为 **`NoBaseline`**：内核跑通、精度通过，只是 muSPARSE 不支持
+  fp16 的 gather/scatter；
+- 性能 `spgemm_csr_*`、`spsv_*` 为 `NotFound`（C API benchmark 中 Triton 崩溃），`spsm_csr_*` 为
+  `NotFound`（3600 秒超时）—— 两类原因不同，崩溃日志还在等 MUSA 那边提供。
+
+跑完用同一个工具看 40 行结果（缺变体时退出码为 1），回传时直接贴它的输出：
+
+```bash
+python3 tools/delivery_table.py pytest_results_mthreads_split              # 加 --markdown 输出 Markdown 表
+```
+
+**`86a09cd`（2026-09-18）之前跑出的性能结果作废**，要用当前 runner 重跑，原因见 `prompt.md` 第 2 节。
+参数为什么都不能省、各状态的含义，见仓库根 `README_cn.md` 的"复现交付测试"一节。
+
+只想看 Python 侧（没有加速比）时，用通用命令 `run_flagsparse_pytest.py --phase both --mode normal --delivery-only ...`。
 
 ```bash
 # 在任意后端上强制切换精度参考，用于验证另一条路径

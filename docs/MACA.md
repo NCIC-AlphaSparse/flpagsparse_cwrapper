@@ -37,28 +37,58 @@ FlagSparse 按运行时分发**厂商参考实现/基线**和**少数按后端�
 
 ---
 
-## 0.5 跑哪些算子、拿什么做参考
+## 0.5 交付复现：40 个变体 × 30 个矩阵（精度 + 性能）
 
-**跑哪些**：`--delivery-only` 让 runner 自己从 `conf/operators.yaml` 的
-`delivery_variants` 反推出该跑的算子（40 个交付变体来自 11 个父算子），不用手写 `--ops`：
+**环境**（每次开工，第 1 节有逐项说明）：
 
 ```bash
-python3 run_flagsparse_pytest.py --phase both --mode normal --delivery-only \
-  --benchmark-input <矩阵目录> --benchmark-warmup 5 --benchmark-iters 20
+export PYTHONPATH=$PWD/src
+export FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_MODEL=c550
+export FLAGSPARSE_MACA_VENDOR=none      # 本机没有 CuPy，不走厂商基线
+python3 -c "from flagsparse.sparse_operations import _common as c; print(c._backend_name(), c._maca_device_model(), c._accel_fallback_reason())"
+# 期望：metax c550 None
 ```
 
-不给这个参数会读 yaml 的 `ops:` 清单，那是个**超集**（18 个）—— 不会漏变体，但会多跑
-7 个结果进不了 `summary.json` 的算子，在 30 个真实矩阵上是实打实的时间。
+**命令**：
 
-**拿什么做参考**（两件不同的事，策略表见 `modified/CUDA.md`）：
+```bash
+setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
+  --phase both --mode normal --delivery-only --gpus 0 --timeout 4500 \
+  --benchmark-input /root/gcx/matrix --benchmark-warmup 5 --benchmark-iters 20 \
+  --benchmark-args=--no-cusparse \
+  --results-dir pytest_results_metax_delivery \
+  > pytest_results_metax_delivery.log 2>&1 < /dev/null &
+```
+
+- `--no-cusparse`：C550 上没有可用的厂商稀疏库，SDDMM 的 `torch.sparse.sampled_addmm` 结果还是错的（7.3 节），
+  性能 baseline 只能是 PyTorch；
+- `--timeout 4500`：`--delivery-only` 已把 spmv/spmm/spsv 收窄到 int32 + non，但 **SDDMM 的 4 个 K 值
+  不收窄**（交付名里没有 K），实测推算全量至少 3660 秒（7.4 节）。只想快速出数，可以改用
+  `--timeout 1200 --op-benchmark-args='sddmm_csr=--k 64'`，但那样 SDDMM 的加速比只含 K=64，和 CUDA 等
+  跑满 4 个 K 的后端**不可直接比较**，报告里要注明；
+- 外层 12 小时、`setsid` 后台：三角类算子在 C550 上可能挂死（第 5 节），挂死时只能靠 KILL。
+
+**参考**：
 
 | | 本后端 |
 |---|---|
-| 性能 baseline（报告里与 FlagSparse 并列计时的那一列） | CuPy **真装了**就用 `cupy_cusparse`，否则 `torch` —— 探测而非假定 |
+| 性能 baseline（报告里与 FlagSparse 并列计时的那一列） | CuPy **真装了**就用 `cupy_cusparse`，否则 `torch` —— 探测而非假定；本机实际是 PyTorch |
 | 精度参考（内核被比对的那个值） | **CPU 上的 SciPy** |
 
-这台 C550 没有 CuPy，所以实际是 PyTorch 计时 + SciPy 参考。精度不走 torch.sparse
-是有实测原因的：MACA 的 fp32 CSR 路径会返回非有限值，拿它当参考会把好内核报成错的。
+精度不走 torch.sparse 是有实测原因的：MACA 的 fp32 CSR 路径会返回非有限值，拿它当参考会把好内核报成错的。
+
+**预期会看到的非 Passed**：`spsv_*` / `spsm_csr` 在走到 `csr_cw`（ALG1，unit 对角）时可能非法访存或挂死，
+记为 `Error` / `Timeout`（第 5 节）；**不要**用 CPU 求解顶替。所有加速比的分母都是 PyTorch，不能和
+CUDA/MUSA 对厂商库的数放在一起比。
+
+跑完用同一个工具看 40 行结果（缺变体时退出码为 1），回传时直接贴它的输出：
+
+```bash
+python3 tools/delivery_table.py pytest_results_metax_delivery              # 加 --markdown 输出 Markdown 表
+```
+
+**`86a09cd`（2026-09-18）之前跑出的性能结果作废**，要用当前 runner 重跑，原因见 `prompt.md` 第 2 节。
+参数为什么都不能省、各状态的含义，见仓库根 `README_cn.md` 的"复现交付测试"一节。
 
 ```bash
 # 在任意后端上强制切换精度参考，用于验证另一条路径
@@ -489,20 +519,9 @@ PYTHONPATH=src python -u run_flagsparse_pytest.py --phase both --mode normal --g
 **现在 `--delivery-only` 会自动收窄**（2026-09-18 起，见 `run_flagsparse_pytest.py` 的
 `DELIVERY_BENCHMARK_ARGS`）：spmv/spmm/spsv 只跑 `int32` + `non`，gather/scatter 只跑 `int32`
 和交付 dtype，启动时每个被收窄的算子会打印一行 `delivery-only: <op> benchmark narrowed with ...`。
-所以 C550 上交付性能只需要：
-
-```bash
-setsid env PYTHONPATH="$PWD/src" FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_VENDOR=none \
-  timeout -s KILL 7200 python3 -u run_flagsparse_pytest.py \
-  --phase performance --mode normal --delivery-only --gpus 0 --timeout 1200 \
-  --benchmark-input /root/gcx/matrix --benchmark-warmup 5 --benchmark-iters 20 \
-  --benchmark-args=--no-cusparse \
-  --results-dir pytest_results_metax_delivery_perf_w5_i20 \
-  > pytest_results_metax_delivery_perf_w5_i20.log 2>&1 < /dev/null &
-```
-
-`sddmm_csr` 的 K sweep（32/64/128/256）**不在**自动收窄范围内：交付名里没有 K，自动砍掉会改变
-报出来的均值口径。要只跑一个 K，仍像下面那样显式传 `--op-benchmark-args='sddmm_csr=--k 64'`。
+交付测试的完整命令见 **0.5 节**。注意 `sddmm_csr` 的 K sweep（32/64/128/256）**不在**自动收窄范围内：
+交付名里没有 K，自动砍掉会改变报出来的均值口径。所以 0.5 节用 `--timeout 4500`；要只跑一个 K，显式传
+`--op-benchmark-args='sddmm_csr=--k 64'`，并在报告里注明。
 
 下面是自动收窄之前本机实际跑的命令（手写 `--op-benchmark-args`），结果即出自它：
 

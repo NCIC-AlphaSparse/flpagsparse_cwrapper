@@ -9,8 +9,9 @@ C API 那一层见
 > **状态：已有有限实测，不是完整交付轮。** 2026-09-17 在 P800 的 `torch_xmlir` CUDA-shim
 > 路径上，当前仓库的 `gather` normal 精度中 f16/f32/c32 通过、f64/c64 因厂商 eager
 > 降精度失败；`spmv_csr` fp32 小矩阵独立参考通过（最大绝对误差 `1.43e-6`）。上层仓库的
-> `results/xpu_variants_40.csv` 保存了 40 个变体的历史状态。尚未在当前提交上跑完 30 矩阵的
-> accuracy + performance 交付轮，下面未标明实测的内容不能当作通过率结论。
+> `results/xpu_variants_40.csv` 保存了 40 个变体的历史状态。2026-09-18 跑过一轮 `--delivery-only`
+> 的 40 变体精度（逐变体结果见 `modified/XPU.md` 第 8 节）；那一轮的性能数字出自 `86a09cd` 之前的 runner，
+> 不能用，要按 1.5 节重跑。下面未标明实测的内容不能当作通过率结论。
 
 ---
 
@@ -70,34 +71,50 @@ PY
 
 ---
 
-## 1.5 跑哪些算子、拿什么做参考
+## 1.5 交付复现：40 个变体 × 30 个矩阵（精度 + 性能）
 
-**跑哪些**：`--delivery-only` 让 runner 自己从 `conf/operators.yaml` 的
-`delivery_variants` 反推出该跑的算子（40 个交付变体来自 11 个父算子），不用手写 `--ops`：
+**环境**（第 1 节自检通过后）：
 
 ```bash
-python3 run_flagsparse_pytest.py --phase both --mode normal --delivery-only \
-  --benchmark-input <矩阵目录> --benchmark-warmup 5 --benchmark-iters 20
+export PYTHONPATH=$PWD/src
+export FLAGSPARSE_BACKEND=xpu FLAGTREE_BACKEND=xpu TRITON_BACKEND=xpu XPU_EVENT_KL3_ENABLE=1
+# 另按厂商运行时要求设置 LD_LIBRARY_PATH
+python3 -c "from flagsparse.sparse_operations import _common as c; print(c._backend_name(), c._accel_device_type(), c._accel_fallback_reason())"
+# 期望：xpu cuda None（torch_xmlir 通过 torch.cuda 运行，device type 为 cuda 是正确的）
 ```
 
-不给这个参数会读 yaml 的 `ops:` 清单，那是个**超集**（18 个）—— 不会漏变体，但会多跑
-7 个结果进不了 `summary.json` 的算子，在 30 个真实矩阵上是实打实的时间。
+**命令**：
 
-**拿什么做参考**（两件不同的事，策略表见 `modified/CUDA.md`）：
+```bash
+setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
+  --phase both --mode normal --delivery-only --gpus <卡号> --timeout 3600 \
+  --benchmark-input <30 个 .mtx 所在目录> --benchmark-warmup 5 --benchmark-iters 20 \
+  --results-dir pytest_results_xpu_delivery \
+  > pytest_results_xpu_delivery.log 2>&1 < /dev/null &
+
+python3 tools/delivery_table.py pytest_results_xpu_delivery   # 跑完后：40 行结果，缺变体时退出码为 1
+```
+
+runner 在 XPU 上自动处理：子进程 `CUDA_VISIBLE_DEVICES=<卡号>`、命令行传逻辑设备 `--device 0`；精度阶段
+**强制**用 CPU 上的 SciPy 参考（`FLAGSPARSE_ACCURACY_REFERENCE=scipy`）；gather / scatter / spmv_csr /
+spmm_csr / sddmm_csr 的性能走 `benchmark/benchmark_xpu.py`，每个矩阵一个子进程，对等价的 PyTorch-XPU
+表达式计时；其余 6 个父算子走能力探测，只有能不能跑、没有加速比。
+
+**参考**：
 
 | | 本后端 |
 |---|---|
-| 性能 baseline（报告里与 FlagSparse 并列计时的那一列） | `torch` —— XDNN 是固定算子集不是描述符 API，没有可绑的厂商稀疏库 |
-| 精度参考（内核被比对的那个值） | **CPU 上的 SciPy** |
+| 性能 baseline | `torch`（PyTorch-XPU 表达式）—— XDNN 是固定算子集不是描述符 API，没有可绑的厂商稀疏库 |
+| 精度参考 | **CPU 上的 SciPy**（runner 强制） |
 
-注意与精度 suite 区分：五个交付算子的性能走 `benchmark/benchmark_xpu.py`，它以
-PyTorch-XPU expression 作精度门禁和性能 baseline；它不是 SciPy 精度 oracle，也不是 XDNN
-厂商稀疏库基线（见第 3 节）。
+`benchmark_xpu.py` 自己也会先核对输出再计时：超出容差的矩阵记为 `MISMATCH`，不计入加速比。这是性能脚本的
+门禁，不是交付的精度结果。
 
-```bash
-# 在任意后端上强制切换精度参考，用于验证另一条路径
-export FLAGSPARSE_ACCURACY_REFERENCE=auto    # auto（默认）| scipy | torch
-```
+**预期会看到的非 Passed**（2026-09-18 在 P800 上实测，`modified/XPU.md` 第 8 节）：40 个变体里只有 gather /
+scatter 的 f16、f32、c32 和 spmv_csr 部分用例通过精度，其余多为 Triton XPU lowering 资源不足（`uni_sram`）、
+legalization 失败或找不到可执行函数。这是平台当前的真实状态，如实回报即可。
+
+**`86a09cd`（2026-09-18）之前跑出的性能结果作废**，原因见 `prompt.md` 第 2 节。
 
 ---
 
@@ -152,10 +169,12 @@ lower 不出来的平台上，这才是有意义的测量 —— 替代方案是
 里。runner 因此用 `_capability_probe_status()` 折叠行状态（全同取之、混合取 `MIXED`、
 无行取 `NO_TESTS`）而不是看退出码 —— 看退出码会把每一行都报成 pass。
 
+交付测试的完整命令见 **1.5 节**（`--mode normal --delivery-only`，带 `--timeout` 和 30 个矩阵）。只想确认链路
+能通时，可以先跑一次冒烟（结果不能当交付数据）：
+
 ```bash
-export PYTHONPATH=$PWD/src FLAGSPARSE_BACKEND=xpu
-python run_flagsparse_pytest.py --phase both --mode quick --gpus 0 \
-  --results-dir pytest_results_xpu
+python run_flagsparse_pytest.py --phase both --mode quick --delivery-only --gpus 0 \
+  --timeout 900 --results-dir pytest_results_xpu_smoke
 ```
 
 > 探测脚本叫 `benchmark/benchmark_ascend_probe.py`，**名字有历史包袱，实现是后端中立的**

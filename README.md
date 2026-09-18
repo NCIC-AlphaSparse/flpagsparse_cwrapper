@@ -20,6 +20,53 @@ Runtime dependencies (install when needed):
 pip install torch triton cupy-cuda12x
 ```
 
+## Reproducing the delivery run (40 variants, 30 matrices)
+
+This is the run whose `summary.json` is the deliverable: **accuracy and performance for the 40
+registered delivery variants** in `conf/operators.yaml` (`delivery_variants`; the delivery list
+has 42 -- `sddmm_csr` c32/c64 wait for a complex kernel), performance measured on a directory of
+**30 MatrixMarket matrices** with 5 warmup and 20 timed iterations. Every backend runs the same
+command; the table below lists what changes per backend, and each `docs/<BACKEND>.md` has the full
+recipe in its "交付复现" section.
+
+```bash
+export PYTHONPATH=$PWD/src
+python3 -c "import flagsparse; print(flagsparse.__file__)"   # must be <repo>/src/flagsparse/__init__.py
+
+timeout -s KILL 21600 python3 run_flagsparse_pytest.py \
+  --phase both --mode normal --delivery-only --gpus 0 --timeout 3600 \
+  --benchmark-input <dir with the 30 .mtx> --benchmark-warmup 5 --benchmark-iters 20 \
+  --results-dir pytest_results_<backend>_delivery
+
+python3 tools/delivery_table.py pytest_results_<backend>_delivery      # 40-row table, exit 1 if any is missing
+```
+
+| Flag | Why it is not optional |
+|---|---|
+| `--delivery-only` | Runs exactly the 11 parents behind the 40 variants, and narrows each benchmark sweep to the delivery axes (int32 indices, `non` op). Without it the runner reads the 18-operator superset and the full int64/trans/conj grid |
+| `--mode normal` | `quick` keeps one shape per class, drops ~40% of the cases and skips the two historically failing ones |
+| `--timeout 3600` | Per operator per phase (per matrix for per-matrix routes). The default `0` never gives up on a hung kernel |
+| outer `timeout -s KILL` | A deadlocked triangular solve blocks in the driver; Ctrl-C does not reach it |
+
+| Backend | Set before the command | Differs from the command above | Speedup is against | Accuracy reference | Recipe |
+|---|---|---|---|---|---|
+| CUDA | -- (`pip install cupy-cuda12x`) | -- | cuSPARSE (CuPy) | cuSPARSE + torch | this section |
+| DCU / ROCm | `pip install hip-python` | SpSV/SpSM may deadlock (read as `Timeout`) | hipSPARSE | hipSPARSE + torch | [docs/DCU.md](docs/DCU.md) §0.5 |
+| MetaX C550 | `FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_VENDOR=none` | `--benchmark-args=--no-cusparse`; SDDMM K sweep needs `--timeout 4500` | PyTorch | SciPy (CPU) | [docs/MACA.md](docs/MACA.md) §0.5 |
+| Moore Threads | `FLAGSPARSE_BACKEND=mthreads` | use `run_flagsparse_split_delivery.py` (performance from the C API) | muSPARSE (C API) | SciPy (CPU) | [docs/MUSA.md](docs/MUSA.md) §0.5 |
+| Ascend 910B | CANN `set_env.sh`; `FLAGSPARSE_BACKEND=ascend FLAGSPARSE_ASCEND_VENDOR=torch` | `--gpus 6,7` only | PyTorch-NPU (5 ops; others probe only) | SciPy (CPU) | [docs/ASCEND.md](docs/ASCEND.md) "交付复现" |
+| Kunlunxin XPU | `FLAGSPARSE_BACKEND=xpu FLAGTREE_BACKEND=xpu TRITON_BACKEND=xpu` | -- | PyTorch-XPU (5 ops; others probe only) | SciPy (CPU) | [docs/XPU.md](docs/XPU.md) §1.5 |
+
+**Results produced before `86a09cd` (2026-09-18) are not comparable**: the old projection averaged
+int64 and trans/conj rows into each `..._int_non` variant and counted rows without a speedup as 0.
+Rerun with the current runner; see `prompt.md` section 2.
+
+What the statuses mean in `summary.json`: `Passed` / `Failed` as measured; `Timeout` the operator
+ran and hit `--timeout`; `NotFound` no row for that variant (not run, or not configured on this
+backend); `NoBaseline` (C API) the kernel ran and passed but the vendor library has no such
+dtype/operator to compare against. On CUDA (RTX 5090, 2026-09-17, before sweep narrowing) the
+full run took 79 minutes, SpSV and SpGEMM being the longest (~20 min each).
+
 ## Backends (8 registered)
 
 FlagSparse dispatches its **vendor reference and baseline** paths on the detected
@@ -154,25 +201,12 @@ python tests/test_spmm_coo.py $M --warmup 2 --iters 5
 
 Make sure no other job is competing for the GPU before trusting the timings.
 
-**5. Unified runner.** `run_flagsparse_pytest.py` has no backend awareness, and its default
-sweep includes `spsv_csr`, `spsv_coo`, `spsv_sell`, `spsm_csr`, and `spsm_coo` — all five
-deadlock on DCU. `--timeout` also defaults to `0` (disabled), so the run would hang forever
-rather than move on. Name the operators explicitly and set a timeout as a backstop:
-
-```bash
-python run_flagsparse_pytest.py --phase both --mode quick --benchmark-input matrix \
-  --timeout 3600 \
-  --ops gather,scatter,spmv_csr,spmv_coo,spmv_csc,spmv_bsr,spmm_csr,spmm_coo,spmm_bsr,spmm_bell,spmm_csc,spgemm_csr,sddmm_csr
-```
-
-That op list is the full `--list-ops` set minus the five solver entries. `--timeout 3600` is
-only a backstop: anything that does hang is recorded as `TIMEOUT` and the sweep continues
-instead of stalling. Measured on DCU, a full 30-matrix sweep takes ~3.3 h in total, and the
-heaviest per-operator benchmarks (`spmv_bsr`, `spmm_coo`, `spmm_bsr`, `spmm_bell`, `spmm_csc`) each need
-more than 1800 s to finish their matrix x dtype grid — hence the 3600 s budget.
-
-Note that `--gpus 0,1` does not help on its own: it splits the operators into two queues, and
-whichever queue holds SpSV/SpSM still blocks.
+**5. Unified runner.** For the delivery run use the command in
+[Reproducing the delivery run](#reproducing-the-delivery-run-40-variants-30-matrices). Its
+`--timeout 3600` is what keeps a deadlocked SpSV/SpSM from stalling the sweep: the operator is
+recorded as `Timeout` and the run moves on. Note that `--gpus 0,1` does not help on its own: it
+splits the operators into two queues, and whichever queue holds SpSV/SpSM still blocks until the
+timeout fires.
 
 For the full DCU bring-up procedure — environment checks, the stale-install trap, how to
 confirm hipSPARSE was actually selected, known limits, and a troubleshooting table — see
@@ -180,11 +214,14 @@ confirm hipSPARSE was actually selected, known limits, and a troubleshooting tab
 
 ### Running the tests on MetaX / MACA C550
 
-On a C550 host, run accuracy and performance together with the PyTorch baseline. This sweep
-uses 30 MatrixMarket inputs, five warmup iterations, and twenty timed iterations. SpSV and
-SpSM are excluded because their current kernels can hang on this platform, and SpMM BELL
-is excluded for now because a single matrix can take much longer than the rest of the
-sweep put together:
+For the **delivery run** (40 variants) use the command in
+[Reproducing the delivery run](#reproducing-the-delivery-run-40-variants-30-matrices) with the
+MetaX settings from its table; [docs/MACA.md](docs/MACA.md) §0.5 has the exact command.
+
+The command below is a different thing: a **full sweep** of the other operators as well
+(CSC, BSR, ...), with the PyTorch baseline, over 30 MatrixMarket inputs. SpSV and SpSM are
+excluded because their current kernels can hang on this platform, and SpMM BELL is excluded
+because a single matrix can take much longer than the rest of the sweep put together:
 
 ```bash
 PYTHONPATH=src python -u run_flagsparse_pytest.py --phase both --mode quick --gpus 0 \
@@ -240,6 +277,14 @@ On MetaX, `test_spmm_csc.py` uses a direct PyTorch CSC baseline:
 the timed window; the CSV records the baseline as `pytorch_ms` and reports
 `triton_speedup_vs_pytorch`. The `--no-cusparse` option disables only the optional vendor
 baseline, not this PyTorch CSC baseline. The COO path remains a correctness reference.
+
+### Running the tests on Ascend 910B
+
+Only NPU cards 6 and 7 may be used. The delivery run is the command in
+[Reproducing the delivery run](#reproducing-the-delivery-run-40-variants-30-matrices) with the
+Ascend settings from its table; [docs/ASCEND.md](docs/ASCEND.md) has the exact command, the
+five operators that are benchmarked against PyTorch-NPU (the rest are capability probes),
+environment checks and known limits.
 
 ## Layout
 
@@ -473,46 +518,3 @@ outputs compare against CPU int32 references.
 ## License
 
 This project is licensed under the [Apache (Version 2.0) license](./LICENSE).
-
-### Running the tests on Ascend 910B
-
-Ascend runs use CANN and `torch_npu`. Performance testing is restricted to NPU cards 6 and
-7. Source the CANN environment and select the Ascend backend:
-
-```bash
-source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
-export PYTHONPATH=$PWD/src
-export FLAGSPARSE_BACKEND=ascend
-export FLAGSPARSE_ASCEND_VENDOR=ops_sparse
-```
-
-In Ascend mode, the unified runner uses `benchmark/benchmark_ascend.py` for the five
-supported operators and leaves all other backend paths unchanged:
-
-```bash
-run_id=$(date -u +%Y%m%dT%H%M%SZ)
-setsid python3 -u run_flagsparse_pytest.py \
-  --ops gather,scatter,spmv_csr,spmm_csr,sddmm_csr \
-  --phase performance --gpus 6,7 \
-  --benchmark-warmup 5 --benchmark-iters 20 \
-  --benchmark-args="--dtypes float16,bfloat16,float32,float64" \
-  --results-dir "pytest_results_ascend_${run_id}" \
-  > "pytest_ascend_${run_id}.log" 2>&1 < /dev/null &
-```
-
-The Ascend benchmark defaults to `float32`. Use `--benchmark-args="--dtypes ..."` to
-run a comma-separated dtype sweep; each dtype is written as a separate performance CSV
-row. The supported values are `float16`, `bfloat16`, `float32`, and `float64` (individual
-operator support is reported in each row).
-
-
-For a direct single-card smoke test:
-
-```bash
-python benchmark/benchmark_ascend.py --device 6 \
-  --m 4096 --n 4096 --nnz 131072 --dense-cols 64 \
-  --warmup 5 --iters 20
-```
-
-See [docs/ASCEND.md](docs/ASCEND.md) for environment checks, result
-format, known limitations, and troubleshooting.

@@ -111,9 +111,10 @@ gather/scatter 的 f16 是交付变体（xlsx 漏写了），不是清单外的�
 # 精度（先做这个，全绿之前不要看性能）
 python3 run_flagsparse_pytest.py --ops gather --phase accuracy --mode normal
 
-# 精度 + 性能，指定矩阵目录（交付就用这条）
-timeout -s KILL 7200 python3 run_flagsparse_pytest.py \
-  --phase both --mode normal --delivery-only --gpus 0 --timeout 900 \
+# 精度 + 性能，指定矩阵目录（交付就用这条；各后端要改的环境变量和参数见
+# README_cn.md "复现交付测试" 一节的表，完整做法见 docs/<BACKEND>.md 的"交付复现"）
+timeout -s KILL 21600 python3 run_flagsparse_pytest.py \
+  --phase both --mode normal --delivery-only --gpus 0 --timeout 3600 \
   --benchmark-input <矩阵目录> --benchmark-warmup 5 --benchmark-iters 20 \
   --results-dir pytest_results_<BACKEND>
 
@@ -137,6 +138,9 @@ python3 tools/run_backend_tests.py --backend <profile> --phase accuracy --mode q
 （spmm_csr 720 组里只有 120 组是交付的），不收窄时 MetaX C550 上 900 秒跑不完。
 自己传的 `--benchmark-args` / `--op-benchmark-args` 优先；`sddmm_csr` 的 K sweep 不在收窄
 范围内（交付名里没有 K）。XPU、Ascend 的专用脚本和探测类后端不注入这些参数。
+
+跑完用 `python3 tools/delivery_table.py <结果目录>` 打印 40 行结果表（缺变体时退出码为 1），回传时直接贴它的
+输出。摩尔线程改用 `run_flagsparse_split_delivery.py`（性能取自 C API，才有 muSPARSE 加速比），见 `docs/MUSA.md` 0.5 节。
 
 **三角类算子（SpSV / SpSM）永远套 `timeout -s KILL`** —— 内核挂死时 Ctrl-C 送不进去，
 进程阻塞在驱动里，代价是整个容器重开。

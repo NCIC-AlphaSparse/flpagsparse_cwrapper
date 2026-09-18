@@ -13,7 +13,7 @@ npu-smi info
 source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
 export PYTHONPATH=$PWD/src
 export FLAGSPARSE_BACKEND=ascend
-export FLAGSPARSE_ASCEND_VENDOR=ops_sparse
+export FLAGSPARSE_ASCEND_VENDOR=torch      # 默认值；ops_sparse 只用于厂商 A/B
 
 python3 - <<'PY'
 import importlib.metadata as md
@@ -32,16 +32,49 @@ PY
 **精度参考是 CPU 上的 SciPy**（见仓库根 `README.md` 的 `FLAGSPARSE_ACCURACY_REFERENCE`）：
 昇腾上的 torch.sparse 本身就是被测对象而不是参考。
 
-## 跑哪些算子
+## 交付复现：40 个变体 × 30 个矩阵（精度 + 性能）
 
-`--delivery-only` 让 runner 从 `conf/operators.yaml` 的 `delivery_variants` 反推该跑的
-算子（40 个交付变体来自 11 个父算子），不用手写 `--ops`。不给这个参数会读 yaml 的
-`ops:` 清单，那是个超集（18 个）—— 不会漏变体，但会多跑 7 个结果进不了 `summary.json`
-的算子。
+只能用 NPU 6、7。先 `npu-smi info` 确认这两张卡上没有别的任务。
 
-Ascend 的路由与其他后端不同：五个算子（gather / scatter / spmv_csr / spmm_csr /
-sddmm_csr）走 `benchmark/benchmark_ascend.py`，其余走能力探测
-`benchmark/benchmark_ascend_probe.py`，两者都由 runner 自动选，见下文。
+```bash
+source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
+export PYTHONPATH="$PWD/src:$PWD" FLAGSPARSE_BACKEND=ascend FLAGSPARSE_ASCEND_VENDOR=torch
+python3 -c "from flagsparse.sparse_operations import _common as c; print(c._backend_name(), c._accel_fallback_reason())"
+# 期望：ascend None
+
+setsid timeout -s KILL 43200 python3 -u run_flagsparse_pytest.py \
+  --phase both --mode normal --delivery-only --gpus 6,7 --timeout 3600 \
+  --benchmark-input /home/matrix --benchmark-warmup 5 --benchmark-iters 20 \
+  --results-dir pytest_results_ascend_delivery \
+  > pytest_results_ascend_delivery.log 2>&1 < /dev/null &
+
+python3 tools/delivery_table.py pytest_results_ascend_delivery   # 跑完后：40 行结果，缺变体时退出码为 1
+```
+
+runner 在 Ascend 上自动做三件事，不需要手动处理：
+
+- **卡隔离**：每个子进程设 `ASCEND_RT_VISIBLE_DEVICES=<6 或 7>`、命令行传逻辑设备 `--device 0`
+  （torch_npu 不认 `CUDA_VISIBLE_DEVICES`，不设的话默认会落到物理 NPU 0）；
+- **路由**：gather / scatter / spmv_csr / spmm_csr / sddmm_csr 的性能走 `benchmark/benchmark_ascend.py`，
+  对 PyTorch-NPU 计时，并通过 `--input` 拿到 `--benchmark-input` 的 30 个 `.mtx`；spmm_csr、sddmm_csr
+  每个矩阵单独一个子进程（`--timeout` 是每个矩阵的上限）。其余 6 个父算子走能力探测
+  `benchmark/benchmark_ascend_probe.py`，**只有能不能跑、没有加速比**；
+- **精度**：上面 5 个算子用 `benchmark/benchmark_ascend_accuracy.py`（每个 dtype 一个合成用例，对 SciPy），
+  其余走 `tests/pytest`，参考同样是 CPU 上的 SciPy。
+
+**跑完先核对真实矩阵确实传进去了**：`pytest_results_ascend_delivery/spmm_csr/performance.csv` 的 `matrix`
+列应当是 30 个 `.mtx` 文件名，而不是 `synthetic`。
+
+**预期会看到的非 Passed**（2026-09-17/18 在 910B4 上实测，`modified/ASCEND.md` 第 3、7 节）：
+
+- float64 / complex128 的不少变体失败：NPU 对 double 的 matmul 等算子不支持（`DT_DOUBLE`）。
+  SDDMM 分块改写后 `sddmm_csr_f64` 精度已通过；
+- SpSV 在 Ascend 上是逐行求解的正确性兜底（`_spsv_ascend_row_sweep`），只支持非转置，转置/共轭用例报
+  `NotImplementedError`；它在百万行矩阵上很慢，而且性能走探测脚本，**不要**把它的耗时当成内核性能；
+- 走探测脚本的 6 个父算子，性能状态可以是 Passed，但没有加速比，`delivery_table.py` 里显示为 `-`。
+
+**`86a09cd`（2026-09-18）之前跑出的性能结果作废**，原因见 `prompt.md` 第 2 节；2026-09-17 那一轮的
+Ascend benchmark 实际用的是合成矩阵（`modified/ASCEND.md` 第 3 节），也不能当作 30 矩阵结果。
 
 ## Ascend fallback 分发表
 
@@ -98,62 +131,38 @@ case 的编译失败变成缓存命中，于是一个编不出来的内核报成
 按各自格式真实构造（分块、切片、三角且对角占优），不是硬凑的——否则算子拒绝一个畸形输入
 会被记成 Ascend 的限制。
 
-## 直接 benchmark
+## 直接 benchmark（排查用）
 
-当前 Ascend benchmark 覆盖 `gather`、`scatter`、`spmv_csr`、`spmm_csr`、`sddmm_csr`：
+`benchmark/benchmark_ascend.py` 覆盖 gather、scatter、spmv_csr、spmm_csr、sddmm_csr。单独调用时直接传
+物理卡号（没有 runner 设的可见设备掩码）：
 
 ```bash
-python3 benchmark/benchmark_ascend.py \
-  --device 6 --m 4096 --n 4096 --nnz 131072 \
+# 一个真实矩阵、一个算子
+python3 benchmark/benchmark_ascend.py --device 6 --op spmm_csr \
+  --input /home/matrix/cage12.mtx --dtypes float16,float32,float64 \
+  --dense-cols 64 --warmup 5 --iters 20 --csv-summary /tmp/asc_spmm.csv
+
+# 不给 --input 时用内置合成 case（--m/--n/--nnz）
+python3 benchmark/benchmark_ascend.py --device 6 --m 4096 --n 4096 --nnz 131072 \
   --dense-cols 64 --warmup 5 --iters 20
 ```
 
-默认只测试 `float32`。需要多 dtype 时，可直接通过统一 runner 的
-`--benchmark-args` 透传 `--dtypes`（逗号分隔）；每个 dtype 会写入独立的 CSV 行：
-
-```bash
-PYTHONPATH=src python3 -u run_flagsparse_pytest.py \
-  --phase performance --ops gather,scatter,spmv_csr,spmm_csr,sddmm_csr \
-  --gpus 6,7 --benchmark-warmup 5 --benchmark-iters 20 \
-  --benchmark-args="--dtypes float16,bfloat16,float32,float64" \
-  --results-dir pytest_results_ascend_dtypes
-```
-
-当前 benchmark 接受 `float16`、`bfloat16`、`float32`、`float64`；具体算子是否能在
-910B/CANN 上执行仍以对应 CSV 行的状态和错误字段为准。
-
-7 号卡使用相同命令，将 `--device 6` 改为 `--device 7`。输出包含 FlagSparse 和
-PyTorch-NPU 的 mean/median/min/p95 延迟，以及 SciPy CPU 最大绝对误差。
+`--input` 可以是一个 `.mtx` 或一个目录（目录下每个 `.mtx` 各跑一遍）。`--dtypes` 接受 `float16`、`bfloat16`、
+`float32`、`float64`；交付只需要 `float16,float32,float64`，bf16 不用跑。输出包含 FlagSparse 和 PyTorch-NPU 的
+mean/median/min/p95 延迟，以及对 SciPy（CPU）的最大绝对误差；CSV 里的 `matrix` 列写明用的是哪个矩阵。
 
 ## 统一 runner
 
-Ascend 模式下，`run_flagsparse_pytest.py` 对上述五个算子改用
-`benchmark/benchmark_ascend.py`，并将 `--gpus` 的卡号传给 `--device`。推荐后台运行：
+交付测试的命令见上面"交付复现"一节。要单独跑几个算子时，同样的环境变量加 `--ops` 即可：
 
 ```bash
-source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
-export PYTHONPATH=$PWD/src
-export FLAGSPARSE_BACKEND=ascend
-export FLAGSPARSE_ASCEND_VENDOR=ops_sparse
-
-run_id=$(date -u +%Y%m%dT%H%M%SZ)
-setsid python3 -u run_flagsparse_pytest.py \
-  --ops gather,scatter,spmv_csr,spmm_csr,sddmm_csr \
-  --phase performance --gpus 6,7 \
-  --benchmark-warmup 5 --benchmark-iters 20 \
-  --results-dir "pytest_results_ascend_${run_id}" \
-  > "pytest_ascend_${run_id}.log" 2>&1 < /dev/null &
+python3 run_flagsparse_pytest.py --ops spmm_csr,sddmm_csr --phase both --mode normal \
+  --gpus 6 --timeout 3600 --benchmark-input /home/matrix \
+  --benchmark-warmup 5 --benchmark-iters 20 --results-dir pytest_results_ascend_spmm_sddmm
 ```
 
-查看进度：
-
-```bash
-tail -f pytest_ascend_<时间戳>.log
-```
-
-每个算子的 `performance.csv` 记录 `triton_ms`（Ascend FlagSparse 路径）、`pytorch_ms`、
-`speedup`、`max_abs_err`；根目录生成 `summary.json`、`summary.csv`、`summary_flat.json`
-和 `result.html`。
+每个算子的 `performance.csv` 记录 `triton_ms`（FlagSparse 的 Ascend 路径）、`pytorch_ms`、`speedup`、
+`max_abs_err` 和 `matrix`；根目录生成 `summary.json`、`summary.csv`、`summary_flat.json` 和 `result.html`。
 
 ## Ascend 实现策略
 
@@ -161,7 +170,9 @@ tail -f pytest_ascend_<时间戳>.log
 `addmm` 在该后端不可用。因此 Ascend 分支使用等价的 torch_npu 原生 fallback：
 
 - SpMV/SpMM：CSR row-id 缓存 + `index_add_`
-- SDDMM：NPU dense matmul 后按 CSR 坐标采样
+- SDDMM：按 CSR 非零元分块做 `sum(x[row] * y[col])`（每块 262144 个非零元），不构造稠密乘积 ——
+  百万行的真实矩阵上稠密乘积会耗尽显存，且 NPU 的 matmul 不支持 double
+- SpSV：逐行求解（`_spsv_ascend_row_sweep`），只支持非转置
 - Gather：NPU `torch.gather`
 - Scatter：NPU `index_copy_`
 
