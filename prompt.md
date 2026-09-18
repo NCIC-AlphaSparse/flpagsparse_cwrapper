@@ -87,6 +87,22 @@ gather/scatter 的 f16 是交付变体（xlsx 漏写了），不是清单外的�
 **不要改这个清单去迁就你的后端。** 某个变体在你这台机器上跑不了，就让它如实报
 `NotFound` / `Skipped` / `Failed` 并写清原因 —— 空结果读起来和通过一模一样，那是最坏的结局。
 
+> **⚠️ `86a09cd`（2026-09-18）之前跑出的 Python 侧性能结果作废，拉新代码后用
+> `--delivery-only` 重跑。** 旧 runner 把结果投影到交付变体时有两个错，报出的加速比不是变体名
+> 说的那个数：
+>
+> 1. **只按 dtype 筛行**：`spmv_csr_f32_int_non` 实际平均了 int32/int64 × non/trans/conj 六种组合；
+> 2. **没有加速比的行按 0 计入均值**（失败行、没有基线的行），与 runner 自己"只对通过且两侧
+>    都有时延的行求平均"的规则相反。
+>
+> CUDA 30 矩阵上重算，偏差最大的：`spmv_csr_f32` 3.07x → 1.19x、`spmv_coo_c32` 1.67x → 0.53x、
+> `spsv_csr_f32` 1.89x → 3.73x、`spsm_csr_f32` 3.80x → 8.93x。gather/scatter/spmm_coo 基本不变。
+>
+> **受影响**：所有用 `tests/test_*.py` 跑性能的后端（CUDA、DCU、MACA、MUSA 的 Python 侧、Ascend
+> 走通用脚本的算子）。**不受影响**：精度结果；C API 侧性能（`capi/tools/write_summary.py`
+> 另有实现）；XPU 的 `benchmark_xpu.py`（CSV 没有 index/op 列）。旧结果目录里的
+> `summary.json` 不会自己更新，必须重跑。
+
 ---
 
 ## 3. 怎么跑
@@ -95,9 +111,9 @@ gather/scatter 的 f16 是交付变体（xlsx 漏写了），不是清单外的�
 # 精度（先做这个，全绿之前不要看性能）
 python3 run_flagsparse_pytest.py --ops gather --phase accuracy --mode normal
 
-# 精度 + 性能，指定矩阵目录
+# 精度 + 性能，指定矩阵目录（交付就用这条）
 timeout -s KILL 7200 python3 run_flagsparse_pytest.py \
-  --phase both --mode normal --gpus 0 --timeout 900 \
+  --phase both --mode normal --delivery-only --gpus 0 --timeout 900 \
   --benchmark-input <矩阵目录> --benchmark-warmup 5 --benchmark-iters 20 \
   --results-dir pytest_results_<BACKEND>
 
@@ -114,6 +130,13 @@ python3 tools/run_backend_tests.py --backend <profile> --phase accuracy --mode q
 | `--timeout` | `0`（关闭） | 挂住就永远不往下走。它是**每个算子每个阶段**的超时，不是全局 |
 | `--phase` | `accuracy` | 要性能数据得给 `both` |
 | `--ops` | 读 yaml 全量 | 已知会挂死的算子（如某些平台的 SpSV/SpSM）要先排除，否则一轮跑不完 |
+
+**`--delivery-only` 会自动收窄 benchmark sweep**（2026-09-18 起）：spmv / spmm / spsv 只跑
+`int32` + `non`，gather / scatter 只跑 `int32` 和交付 dtype，启动时每个被收窄的算子打一行
+`delivery-only: <op> benchmark narrowed with ...`。默认 sweep 还包含 int64 和 trans/conj
+（spmm_csr 720 组里只有 120 组是交付的），不收窄时 MetaX C550 上 900 秒跑不完。
+自己传的 `--benchmark-args` / `--op-benchmark-args` 优先；`sddmm_csr` 的 K sweep 不在收窄
+范围内（交付名里没有 K）。XPU、Ascend 的专用脚本和探测类后端不注入这些参数。
 
 **三角类算子（SpSV / SpSM）永远套 `timeout -s KILL`** —— 内核挂死时 Ctrl-C 送不进去，
 进程阻塞在驱动里，代价是整个容器重开。

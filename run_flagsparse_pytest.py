@@ -1463,12 +1463,28 @@ def write_phase_result(
 def _base_env(project_root: Path, gpu_id: int) -> dict[str, str]:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    if os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower() == "ascend":
+        # torch_npu ignores CUDA_VISIBLE_DEVICES: without this every child landed
+        # on physical NPU 0 whatever --gpus said (measured on 910B, 2026-09-17).
+        env["ASCEND_RT_VISIBLE_DEVICES"] = str(gpu_id)
     env["PYTHONUNBUFFERED"] = "1"
     pythonpath = [str(project_root / "src"), str(project_root)]
     if env.get("PYTHONPATH"):
         pythonpath.append(env["PYTHONPATH"])
     env["PYTHONPATH"] = os.pathsep.join(pythonpath)
     return env
+
+
+def _subprocess_device_id(gpu_id: int) -> int:
+    """The device ordinal to pass a child whose visible devices _base_env masked.
+
+    Backends whose runtime honours that mask renumber the one visible device to
+    0, so passing the physical id would point past it: Ascend reads
+    ASCEND_RT_VISIBLE_DEVICES, and XPU's torch_xmlir shim reads
+    CUDA_VISIBLE_DEVICES. Every other backend keeps the id it was given.
+    """
+    backend = os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower()
+    return 0 if backend in ("ascend", "xpu") else gpu_id
 
 
 def _terminate_process_group(proc: subprocess.Popen[str]) -> None:
@@ -1574,7 +1590,7 @@ def run_accuracy(
             "--op",
             op,
             "--device",
-            str(gpu_id),
+            str(_subprocess_device_id(gpu_id)),
             "--output",
             str(result_path),
         ]
@@ -2333,10 +2349,9 @@ def run_performance(
     if not template:
         return _not_configured(op, "performance", "no performance command mapping")
 
-    # _base_env exposes exactly one physical accelerator to each child.  XPU's
-    # CUDA shim therefore sees that accelerator as cuda:0, regardless of the
-    # physical id selected by --gpus.
-    script_device = 0 if backend == "xpu" else gpu_id
+    # _base_env exposes exactly one physical accelerator to each child, which
+    # XPU and Ascend then see as device 0 regardless of the id --gpus selected.
+    script_device = _subprocess_device_id(gpu_id)
 
     if (
         (op in PER_MATRIX_PERFORMANCE_OPS or (backend == "xpu" and op in XPU_BASELINE_OPS))
