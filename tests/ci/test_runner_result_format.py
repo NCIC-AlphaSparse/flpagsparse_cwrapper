@@ -748,3 +748,13 @@ def test_child_device_matches_the_visible_device_mask(
     assert env["CUDA_VISIBLE_DEVICES"] == "6"
     assert env.get("ASCEND_RT_VISIBLE_DEVICES") == ascend_mask
     assert runner._subprocess_device_id(6) == child_device
+
+
+def test_delivery_projection_keeps_a_timeout_distinct_from_not_run():
+    # Ascend, 2026-09-17: an operator killed by --timeout had no dtype rows, and
+    # every one of its variants then read NotFound -- the same as never running.
+    timed_out = runner._delivery_performance_phase({"status": "TIMEOUT"}, "f32")
+    assert timed_out["status"] == "TIMEOUT"
+    assert timed_out["data"] == {}
+    empty = runner._delivery_performance_phase({"status": "PASS"}, "f32")
+    assert empty["status"] == "NOT_CONFIGURED"

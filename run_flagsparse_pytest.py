@@ -647,8 +647,9 @@ ASCEND_PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
             "{device}",
             "--csv-summary",
             "{csv}",
+            # bf16 is not a delivery dtype; measuring it only costs time.
             "--dtypes",
-            "float16,bfloat16,float32,float64",
+            "float16,float32,float64",
             "--warmup",
             "{warmup}",
             "--iters",
@@ -2926,6 +2927,12 @@ def _delivery_performance_phase(
         if key.lower() in _DELIVERY_PERF_DTYPES[dtype]
     }
     if not selected:
+        # A process-level timeout has no dtype rows to project, but it did run:
+        # report Timeout rather than the NotFound an unconfigured variant gets.
+        if str(phase_result.get("status") or "").upper() == "TIMEOUT":
+            result = dict(phase_result)
+            result["data"] = {}
+            return result
         return _delivery_not_configured_phase(
             "performance", f"the benchmark recorded no {dtype} rows"
         )

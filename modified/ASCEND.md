@@ -327,11 +327,20 @@ setsid timeout -k 15s -s KILL 7200s \
 | §1.2 `sddmm_csr.py` | Ascend 分支由整块 `torch.matmul(x, y.T)` 改为按非零元分块采样 | 分块大小提成常量 `_ASCEND_SDDMM_CHUNK_NNZ = 262144`；在 CUDA 上强制走该分支、分块取 7/1000/262144，与 Triton 结果一致（f32 3.8e-6，f64 1e-14） |
 | §1.2 `benchmark_ascend_accuracy.py` | 默认 `--dtypes` 加 `float16` | 无 |
 
-**等补丁再合**（请在 Ascend 机器上先 pull 到 `86a09cd`，再 `git diff 86a09cd > modified/ASCEND.patch` 回传）：
+**第二批（2026-09-18，Ascend 回传了 3 个完整文件：runner、`sddmm_csr.py`、`benchmark_ascend_accuracy.py`）**：
+与 `87b0aff` 逐行对比后，`sddmm_csr.py`、`benchmark_ascend_accuracy.py` 与第一批合入的内容等价；runner 里
+新合入两处：
 
-- runner：`ASCEND_PERFORMANCE_COMMANDS` 加 `--input {input}`、去掉 bf16；`ASCEND_PER_MATRIX_PERFORMANCE_OPS`；
-  `_delivery_performance_phase()` 在父任务 TIMEOUT 时保留 `Timeout`（这个函数 `86a09cd` 已重写，需手工合）。
-  `--input` 必须和下一条同时合，否则仓库版 `benchmark_ascend.py` 不认该参数、性能阶段全部失败；
+| 改动 | 说明 |
+|---|---|
+| `ASCEND_PERFORMANCE_COMMANDS` 去掉 `bfloat16` | bf16 不是交付 dtype |
+| `_delivery_performance_phase()`：父任务 `TIMEOUT` 且没有该 dtype 的行时保留 `Timeout` | 合进 `86a09cd` 重写后的函数；新增 CI 用例 |
+
+**仍缺，等文件再合**（`spsv.py` 和 `benchmark/benchmark_ascend.py` 都没有发过来）：
+
+- runner：`ASCEND_PERFORMANCE_COMMANDS` 加 `--input {input}`；`ASCEND_PER_MATRIX_PERFORMANCE_OPS`（spmm_csr、sddmm_csr
+  逐矩阵隔离）。这两处 runner 代码已经拿到，但都要把 `.mtx` 路径传给 `benchmark_ascend.py --input`，
+  **必须和下一条同时合**，否则仓库版 `benchmark_ascend.py` 不认该参数、性能阶段全部失败；
 - `benchmark/benchmark_ascend.py`：`.mtx` 输入、`--op` 选择性执行、`matrix` 列、SDDMM 分块参考；
 - `spsv.py` 的 `_spsv_ascend_row_sweep()`：台账只有算法描述。合入前要改一处——"无对角值时写入零"会静默
   给出错误解，应当报错。
