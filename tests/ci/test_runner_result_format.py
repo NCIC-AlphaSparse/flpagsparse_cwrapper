@@ -731,3 +731,20 @@ def test_delivery_benchmark_args_name_flags_the_scripts_accept():
         source = script.read_text(encoding="utf-8")
         for flag in (arg for arg in args if arg.startswith("--")):
             assert f'"{flag}"' in source, f"{script.name} has no {flag}"
+
+
+@pytest.mark.parametrize(
+    ("backend", "ascend_mask", "child_device"),
+    [("ascend", "6", 0), ("xpu", None, 0), ("cuda", None, 6), ("", None, 6)],
+)
+def test_child_device_matches_the_visible_device_mask(
+    monkeypatch, backend, ascend_mask, child_device
+):
+    # torch_npu ignores CUDA_VISIBLE_DEVICES, so Ascend children landed on NPU 0
+    # whatever --gpus said; masked children then see their one card as device 0.
+    monkeypatch.setenv("FLAGSPARSE_BACKEND", backend)
+    monkeypatch.delenv("ASCEND_RT_VISIBLE_DEVICES", raising=False)
+    env = runner._base_env(ROOT, 6)
+    assert env["CUDA_VISIBLE_DEVICES"] == "6"
+    assert env.get("ASCEND_RT_VISIBLE_DEVICES") == ascend_mask
+    assert runner._subprocess_device_id(6) == child_device
