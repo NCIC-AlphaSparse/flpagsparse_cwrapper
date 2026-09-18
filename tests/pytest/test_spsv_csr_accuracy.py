@@ -14,6 +14,8 @@
 
 import pytest
 import torch
+from flagsparse.sparse_operations import _common as common
+from tests import reference_utils
 
 from flagsparse import (
     FlagSparseDnVecDescr,
@@ -129,6 +131,19 @@ def _dense_ref_spsv(A, b, *, lower, op_mode="NON", unit_diagonal=False):
     the golden device; callers compare with ``x.to(x_ref.device)``.
     """
     golden = golden_device()
+    if common._use_scipy_accuracy_reference():
+        A_csr = A.to_sparse_csr()
+        matrix = reference_utils.scipy_csr(
+            A_csr.values(), A_csr.col_indices(), A_csr.crow_indices(), A.shape,
+            reference_utils.reference_dtype(A.dtype),
+        )
+        solved = reference_utils.triangular_solve(
+            matrix, b, reference_utils.reference_dtype(b.dtype),
+            lower=lower, unit_diagonal=unit_diagonal, op=op_mode,
+        )
+        return reference_utils.as_torch(
+            solved, reference_utils.reference_dtype(b.dtype), golden
+        ).to(b.dtype)
     A_eff = _apply_ref_op(A.to(golden), op_mode)
     x = torch.linalg.solve_triangular(
         A_eff,
@@ -137,6 +152,30 @@ def _dense_ref_spsv(A, b, *, lower, op_mode="NON", unit_diagonal=False):
         unitriangular=unit_diagonal,
     )
     return x.squeeze(-1)
+
+
+def _solve_triangular(A, B, *, upper, unitriangular=False):
+    """CPU SciPy triangular oracle for direct CSR reference assertions."""
+    if common._use_scipy_accuracy_reference():
+        matrix = A.to_sparse_csr()
+        scipy_matrix = reference_utils.scipy_csr(
+            matrix.values(), matrix.col_indices(), matrix.crow_indices(), A.shape,
+            reference_utils.reference_dtype(A.dtype),
+        )
+        solved = reference_utils.triangular_solve(
+            scipy_matrix, B.squeeze(-1), reference_utils.reference_dtype(B.dtype),
+            lower=not upper, unit_diagonal=unitriangular,
+        )
+        # Back to the operand dtype: the oracle solves at the reference dtype,
+        # and allclose() refuses to compare float32 against float64.
+        return (
+            reference_utils.as_torch(
+                solved, reference_utils.reference_dtype(B.dtype), golden_device()
+            )
+            .to(B.dtype)
+            .unsqueeze(-1)
+        )
+    return torch.linalg.solve_triangular(A, B, upper=upper, unitriangular=unitriangular)
 
 
 def _cupy_apply_op(A_cp, op_mode):
@@ -243,7 +282,7 @@ def test_spsv_csr_non_trans_supported_combos(n, dtype, index_dtype):
     device = accelerator_device()
     A = _build_triangular(n, dtype, golden_device(), lower=True)
     b = _rand_like(dtype, (n,), device)
-    x_ref = torch.linalg.solve_triangular(
+    x_ref = _solve_triangular(
         A.to(dtype), b.to(device=A.device, dtype=dtype).unsqueeze(-1), upper=False
     ).squeeze(-1)
 
@@ -1398,7 +1437,7 @@ def test_spsv_csr_transpose_family_supported_combos(n, dtype, index_dtype, op_mo
     b = _rand_like(dtype, (n,), device)
     A_ref = A.to(dtype)
     b_ref = b.to(device=A_ref.device, dtype=dtype)
-    x_ref = torch.linalg.solve_triangular(
+    x_ref = _solve_triangular(
         _apply_ref_op(A_ref, op_mode),
         b_ref.unsqueeze(-1),
         upper=_effective_upper(True, op_mode),
@@ -1499,7 +1538,7 @@ def test_spsv_csr_non_trans_upper_supported_combos(n, dtype, index_dtype):
     device = accelerator_device()
     A = _build_triangular(n, dtype, golden_device(), lower=False)
     b = _rand_like(dtype, (n,), device)
-    x_ref = torch.linalg.solve_triangular(
+    x_ref = _solve_triangular(
         A.to(dtype), b.to(device=A.device, dtype=dtype).unsqueeze(-1), upper=True
     ).squeeze(-1)
 
@@ -1537,7 +1576,7 @@ def test_spsv_csr_upper_transpose_family_supported_combos(
     b = _rand_like(dtype, (n,), device)
     A_ref = A.to(dtype)
     b_ref = b.to(device=A_ref.device, dtype=dtype)
-    x_ref = torch.linalg.solve_triangular(
+    x_ref = _solve_triangular(
         _apply_ref_op(A_ref, op_mode),
         b_ref.unsqueeze(-1),
         upper=_effective_upper(False, op_mode),

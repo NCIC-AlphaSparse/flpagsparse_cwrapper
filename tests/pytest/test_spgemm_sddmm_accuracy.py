@@ -16,6 +16,8 @@ import pytest
 import torch
 
 from flagsparse import flagsparse_sddmm_csr, flagsparse_spgemm_csr
+from flagsparse.sparse_operations import _common as common
+from tests import reference_utils
 
 from tests.pytest.accuracy_utils import (
     ACCELERATOR_REQUIRED,
@@ -88,7 +90,19 @@ def test_spgemm_csr_matches_torch(M, N, K, dtype, indptr_dtype):
     golden = golden_device()
     A = _random_csr(M, K, dtype, golden)
     B = _random_csr(K, N, dtype, golden)
-    ref = torch.sparse.mm(A, B.to_dense())
+    if common._use_scipy_accuracy_reference():
+        left = reference_utils.scipy_csr(
+            A.values(), A.col_indices(), A.crow_indices(), (M, K), dtype
+        )
+        right = reference_utils.scipy_csr(
+            B.values(), B.col_indices(), B.crow_indices(), (K, N), dtype
+        )
+        # spgemm() returns a SciPy sparse matrix; densify it before torch sees it.
+        ref = reference_utils.as_torch(
+            reference_utils.spgemm(left, right).toarray(), dtype, golden
+        )
+    else:
+        ref = torch.sparse.mm(A, B.to_dense())
     c_data, c_indices, c_indptr, c_shape = flagsparse_spgemm_csr(
         A.values().to(device),
         A.col_indices().to(torch.int32).to(device),
@@ -163,9 +177,11 @@ def test_sddmm_csr_matches_sampled_dense_reference(M, N, K, dtype, indptr_dtype)
         torch.arange(M, dtype=torch.int64, device=golden),
         indptr[1:] - indptr[:-1],
     )
-    ref = (
-        alpha * torch.sum(x[row_ids] * y[indices.to(torch.int64)], dim=1) + beta * data
-    )
+    if common._use_scipy_accuracy_reference():
+        sampled = reference_utils.sddmm_csr_values(indices, indptr, x, y, dtype)
+        ref = torch.as_tensor(sampled, dtype=dtype) * alpha + data.cpu() * beta
+    else:
+        ref = alpha * torch.sum(x[row_ids] * y[indices.to(torch.int64)], dim=1) + beta * data
     got = flagsparse_sddmm_csr(
         data=data.to(device),
         indices=indices.to(device),

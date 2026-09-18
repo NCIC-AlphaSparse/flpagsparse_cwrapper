@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Execute FlagSparse kernels on Kunlunxin XPU and record latency.
-
-This runner intentionally has no baseline.  It answers only whether the
-FlagSparse kernel can be constructed and executed on the requested device.
-"""
+"""Benchmark FlagSparse kernels against equivalent PyTorch-XPU expressions."""
 
 from __future__ import annotations
 
@@ -99,6 +95,16 @@ def _max_abs_error(actual, expected) -> float:
     return float(difference.max().item()) if difference.numel() else 0.0
 
 
+def _matches_tolerance(actual, expected, rtol: float, atol: float) -> bool:
+    """Compare on the host because torch_xmlir eager lacks some XPU predicates."""
+
+    actual_host = actual.detach().float().cpu()
+    expected_host = expected.detach().float().cpu()
+    return bool(
+        (actual_host - expected_host).abs().le(atol + rtol * expected_host.abs()).all().item()
+    )
+
+
 def _tolerance(dtype_name: str) -> tuple[float, float]:
     return (1e-2, 1e-2) if dtype_name in {"float16", "bfloat16"} else (1e-4, 1e-4)
 
@@ -186,20 +192,40 @@ def _run_case(torch, fs, op: str, case: Case, warmup: int, iters: int, device_id
     else:
         raise ValueError(f"unsupported XPU baseline operator: {op}")
 
-    # Execute the candidate once for validity.  A vendor/PyTorch baseline is
-    # intentionally not required for this XPU smoke-performance pass.
+    # Check the same tensors that will subsequently be timed.  Both closures
+    # overwrite their output buffers, so the warmup loops do not alter this result.
     candidate_result = candidate()
+    baseline_result = baseline()
     _sync(torch)
+    rtol, atol = _tolerance(case.dtype_name)
+    max_abs_err = _max_abs_error(candidate_result, baseline_result)
+    if not _matches_tolerance(candidate_result, baseline_result, rtol, atol):
+        return {
+            "dtype": case.dtype_name,
+            "shape": f"matrix={matrix_name},m={case.rows},n={case.cols},nnz={case.nnz},k={case.dense_cols}",
+            "triton_ms": "",
+            "pytorch_ms": "",
+            "speedup": "",
+            "triton_speedup_vs_pytorch": "",
+            "max_abs_err": max_abs_err,
+            "status": "MISMATCH",
+            "baseline": "pytorch",
+            "reason": f"max_abs_err={max_abs_err:.8g} exceeds rtol={rtol:g}, atol={atol:g}",
+        }
+
     triton_ms = _measure(torch, candidate, warmup, iters)
+    pytorch_ms = _measure(torch, baseline, warmup, iters)
+    speedup = pytorch_ms / triton_ms if triton_ms > 0.0 else ""
     return {
         "dtype": case.dtype_name,
         "shape": f"matrix={matrix_name},m={case.rows},n={case.cols},nnz={case.nnz},k={case.dense_cols}",
         "triton_ms": triton_ms,
-        "pytorch_ms": "",
-        "speedup": "",
-        "max_abs_err": "",
+        "pytorch_ms": pytorch_ms,
+        "speedup": speedup,
+        "triton_speedup_vs_pytorch": speedup,
+        "max_abs_err": max_abs_err,
         "status": "PASS",
-        "baseline": "",
+        "baseline": "pytorch",
     }
 
 
@@ -244,11 +270,11 @@ def main() -> int:
                 rows.append(_run_case(torch, fs, args.op, Case(args.m, args.n, args.nnz, args.dense_cols, dtype_name), args.warmup, args.iters, args.device, matrix_path))
             except Exception as exc:
                 label = matrix_path.name if matrix_path is not None else args.op
-                rows.append({"dtype": dtype_name, "shape": label, "triton_ms": "", "pytorch_ms": "", "speedup": "", "max_abs_err": "", "status": "ERROR", "baseline": "", "reason": str(exc)})
+                rows.append({"dtype": dtype_name, "shape": label, "triton_ms": "", "pytorch_ms": "", "speedup": "", "triton_speedup_vs_pytorch": "", "max_abs_err": "", "status": "ERROR", "baseline": "pytorch", "reason": str(exc)})
 
     path = Path(args.csv_summary)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields = ("dtype", "shape", "triton_ms", "pytorch_ms", "speedup", "max_abs_err", "status", "baseline", "reason")
+    fields = ("dtype", "shape", "triton_ms", "pytorch_ms", "speedup", "triton_speedup_vs_pytorch", "max_abs_err", "status", "baseline", "reason")
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()

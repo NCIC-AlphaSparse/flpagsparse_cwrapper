@@ -249,6 +249,10 @@ flagsparseStatus_t launch_csr_rowpar(flagsparseHandle_t handle, SpMatDescr* A,
     sig += std::to_string(kCsrBlockNnz) + ",";
     sig += std::to_string(segments) + ",";
     sig += ops.has_beta ? "True" : "False";
+    // XPU_COMPAT (real kernel only): the Python side sets it on Kunlunxin XPU,
+    // where the C API does not run, so it is always False here. Leaving it out
+    // of the signature fails every real CSR / COO_ALG2 launch on every backend.
+    if (!ops.complex_op) sig += ",False";
 
     std::vector<jit::Arg> args;
     args.reserve(8);

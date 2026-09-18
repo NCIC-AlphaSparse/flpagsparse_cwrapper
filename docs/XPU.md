@@ -6,11 +6,11 @@ C API 那一层见
 `capi/docs/XPU.md`（结论是 C API 目前在昆仑芯上跑不起来，可达的只有 Python 侧）；
 各后端文档的对应关系见 [README.md](README.md)。
 
-> **状态：有实机脚本，没有实机通过率。** 与 MACA（921 用例实机全绿）、MUSA（1564 用例
-> 实机全绿）不同，昆仑芯这边回传的是**执行路径**（`benchmark/benchmark_xpu.py` 与
-> `benchmark_xpu_variants.py`，后者的 `MEASURED` 表注明每条都在 P800 上单独启动过），
-> **不是一轮成建制的精度/性能结果**。本文第 1、2 节仍来自代码与注册表；下面凡是"期望"
-> 的地方，都要在真机上确认后再当结论用。
+> **状态：已有有限实测，不是完整交付轮。** 2026-09-17 在 P800 的 `torch_xmlir` CUDA-shim
+> 路径上，当前仓库的 `gather` normal 精度中 f16/f32/c32 通过、f64/c64 因厂商 eager
+> 降精度失败；`spmv_csr` fp32 小矩阵独立参考通过（最大绝对误差 `1.43e-6`）。上层仓库的
+> `results/xpu_variants_40.csv` 保存了 40 个变体的历史状态。尚未在当前提交上跑完 30 矩阵的
+> accuracy + performance 交付轮，下面未标明实测的内容不能当作通过率结论。
 
 ---
 
@@ -21,7 +21,7 @@ C API 那一层见
 | 字段 | 值 |
 |---|---|
 | 厂商 | Kunlunxin XPU |
-| torch 命名空间 | `torch.xpu` |
+| torch 命名空间 | `torch_xmlir` 构建走 `torch.cuda` shim；`torch_xpu` 构建才走原生 `torch.xpu` |
 | 插件模块 | `torch_xmlir`、`torch_xpu`（任一可 import 即可） |
 | 设备名 token | `kunlun`、`xpu` |
 
@@ -60,8 +60,13 @@ print("fallback reason  :", C._accel_fallback_reason())
 PY
 ```
 
-`accel device type` 若是 `cuda` 而不是 `xpu`，说明插件没找到、整轮会跑在 CUDA 语义下 ——
-和 MUSA 那边同一个坑，见 `MUSA.md` 第 0 节。
+`torch_xmlir` 是 FlagTree 的 CUDA-shim 构建：它将 `torch.cuda` 调用路由到昆仑芯，
+`torch.xpu` 仍是上游 PyTorch 的不支持 stub，`torch.xpu.is_available()` 可为 `False` 且
+`torch.device("xpu")` 会报 `Torch not compiled with XPU enabled`。这是该构建的预期行为，
+不是 CUDA 回退；此时自检的正确结果是 `backend=xpu`、`accel device type=cuda`、
+`fallback reason=None`。同时设置 `FLAGTREE_BACKEND=xpu`、`TRITON_BACKEND=xpu` 和
+`XPU_EVENT_KL3_ENABLE=1`，并使用厂商运行时要求的 `LD_LIBRARY_PATH`。2026-09-17 已以该
+路径在 P800 的设备 1 跑通 `gather float32`（256x256、nnz=4096）。
 
 ---
 
@@ -85,8 +90,9 @@ python3 run_flagsparse_pytest.py --phase both --mode normal --delivery-only \
 | 性能 baseline（报告里与 FlagSparse 并列计时的那一列） | `torch` —— XDNN 是固定算子集不是描述符 API，没有可绑的厂商稀疏库 |
 | 精度参考（内核被比对的那个值） | **CPU 上的 SciPy** |
 
-注意与性能路径区分：五个交付算子的性能走 `benchmark/benchmark_xpu.py`，它只给
-时延和「能否执行」，不给加速比（见第 3 节）。
+注意与精度 suite 区分：五个交付算子的性能走 `benchmark/benchmark_xpu.py`，它以
+PyTorch-XPU expression 作精度门禁和性能 baseline；它不是 SciPy 精度 oracle，也不是 XDNN
+厂商稀疏库基线（见第 3 节）。
 
 ```bash
 # 在任意后端上强制切换精度参考，用于验证另一条路径
@@ -97,9 +103,9 @@ export FLAGSPARSE_ACCURACY_REFERENCE=auto    # auto（默认）| scipy | torch
 
 ## 2. 内核：没有 XPU 专用实现，走共享那一份
 
-`src/flagsparse/sparse_operations/` 下的算子文件里**没有任何 `_is_xpu_runtime()` 分支**
-（可以自己 grep 确认）。`backends/xpu/` 目录已建好但只有 `__init__.py`，算子代码留空，
-因此解析到共享实现。
+`src/flagsparse/sparse_operations/` 仍以共享实现为主；当前仅有 `_common.py` 的运行时解析和
+`spmv_csr.py` 的兼容分支使用 `_is_xpu_runtime()`。`backends/xpu/` 目录仍只有 `__init__.py`，
+没有一份按后端复制的算子实现。
 
 这是有意的：`_dispatch.py` 的覆盖层默认为空，**只有真正分叉的文件才会出现在里面**。
 真在昆仑芯上要改，优先级从低到高是——加 profile 表项（launch 参数、`num_warps` 之类）
@@ -131,15 +137,16 @@ PROBE_ONLY_BACKENDS: tuple[str, ...] = ("gcu", "mlu")     # xpu 已经不在里�
 XPU_BASELINE_OPS = ("gather", "scatter", "spmv_csr", "spmm_csr", "sddmm_csr")
 ```
 
-这五个走 `benchmark/benchmark_xpu.py`，其余算子仍走**能力探测**，按算子报
+这五个走 `benchmark/benchmark_xpu.py`，以等价的 PyTorch-XPU tensor expression 为 baseline，
+先核对输出再分别计时，报告 `triton_ms`、`pytorch_ms`、`max_abs_err` 和
+`triton_speedup_vs_pytorch`（也保留兼容列 `speedup`）。其余算子仍走**能力探测**，按算子报
 `PASS` / `REJECTED` / `TRITON_COMPILE` / `ERROR` / `NO_ADAPTER`。在一个内核可能根本
 lower 不出来的平台上，这才是有意义的测量 —— 替代方案是一个空的性能阶段，而空阶段
 读起来和通过一模一样。
 
-> **`benchmark_xpu.py` 给的是时延和"能否执行"，不是加速比。** 它为五个算子各建了一个
-> PyTorch-XPU 参考闭包，但**一次都没调用**，`pytorch_ms` / `speedup` / `max_abs_err`
-> 三列恒为空，`status` 只有 PASS（没抛异常）或 ERROR（带 reason）。脚本 docstring 写明了
-> 这是有意的。要真做对比，把那几个 `baseline()` 调起来即可，结构都在。
+> **这是 PyTorch baseline，不是厂商 sparse-library baseline。** XDNN 没有可替代 cuSPARSE
+> 描述符 API 的通用稀疏接口；因此 `speedup` 表示 FlagSparse 相对 PyTorch-XPU expression 的
+> 比值。输出超出 dtype 容差时该矩阵为 `MISMATCH`，不会参与平均加速比。
 
 探测脚本和 `benchmark_xpu.py` **无论内核跑通、被拒还是编译失败都 exit 0**，结论在 CSV 行
 里。runner 因此用 `_capability_probe_status()` 折叠行状态（全同取之、混合取 `MIXED`、
@@ -159,7 +166,9 @@ python run_flagsparse_pytest.py --phase both --mode quick --gpus 0 \
 
 ### 单独跑那个性能脚本（排查时最有用）
 
-runner 会自动调它，但定位问题时单独跑更快 —— 它一个算子一个进程，报错不会被上层吞掉：
+runner 会自动调它；给目录时，XPU baseline 的每个矩阵都会由 runner 以 `--matrix` 在独立
+进程中执行，因此一张卡住的矩阵不会吞掉同一算子的其余结果。runner 已把 `--gpus 4` 映射为
+子进程的 `CUDA_VISIBLE_DEVICES=4` 和逻辑 `--device 0`；单独调用脚本时则传物理设备号。定位问题时单独跑更快：
 
 ```bash
 export PYTHONPATH=$PWD/src FLAGSPARSE_BACKEND=xpu
@@ -168,13 +177,14 @@ python3 benchmark/benchmark_xpu.py --op spmv_csr --device 0 \
 # --matrix <file.mtx> 或 --matrix-dir <目录> 用真实矩阵；不给就用合成输入
 ```
 
-CSV 的 `status` 只有两种：`PASS`（跑通了）或 `ERROR`（带 `reason`）。
+CSV 的 `status` 可以是 `PASS`、`MISMATCH` 或 `ERROR`；`MISMATCH` 会带误差与容差说明且不计性能。
 `benchmark_xpu_variants.py` 是按清单跑变体的那一层，接受 `--manifest` 与 `--matrix-dir`。
 
 ## 4. 没有厂商基线，而且不是"等一个库名"
 
 昆仑芯的数学库是 **XDNN**，提供的是**固定的稀疏算子**，不是描述符式的 generic API。
-所以 speedup 列会是空的，`reason` 字段里写明原因。
+因此没有 XDNN sparse-library 的可比速度；当前 `speedup` 是相对 PyTorch-XPU expression 的速度比，
+不是 XDNN 的结果。
 
 这和 MACA / MUSA 的情况**不是一回事**，不要混：
 
@@ -206,12 +216,12 @@ CSV 的 `status` 只有两种：`PASS`（跑通了）或 `ERROR`（带 `reason`�
 
 | 现象 | 首先检查 |
 |---|---|
-| `backend` 不是 `xpu` / `accel device type` 不是 `xpu` | 厂商插件（`torch_xmlir` / `torch_xpu`）是否真的能 import。**只有 `torch.xpu` 命名空间不算** —— 上游 PyTorch 给 Intel GPU 也装它，认了就会把 Intel 卡当昆仑芯 |
+| `backend` 不是 `xpu` / `fallback reason` 非空 | 厂商插件（`torch_xmlir` / `torch_xpu`）是否真的能 import。`torch_xmlir` 路径的 `accel device type=cuda` 是预期；只有 `torch.xpu` 命名空间不算 —— 上游 PyTorch 给 Intel GPU 也装它，认了就会把 Intel 卡当昆仑芯 |
 | `fallback reason` 不是 `None` | 同上；不处理的话整轮会**静默跑在 CUDA 语义下**，跑出来的不是这台机器的数 |
 | 某算子报 `TRITON_COMPILE` | 内核在 FlagTree 的 xpu target 上 lower 不出来。先用最小 Triton kernel 确认后端本身可用（参考 `MACA.md` 2.1），再看是哪个算子 |
 | 某算子报 `REJECTED` | 算子自己拒绝了输入（dtype/layout/shape），是**有意的限制**不是缺陷，看 `reason` |
 | 某算子报 `NO_ADAPTER` | 探测脚本没有这个算子的输入配方，是脚本的缺口，按 `benchmark_ascend_probe.py` 里已有的算子照着加 |
-| 性能列有数但没有加速比 | 预期行为：没有厂商稀疏库可比，见第 4 节 |
+| 性能列为空 | 若为 `MISMATCH`，先修精度；若为 `ERROR`，先看 reason。`PASS` 时应有相对 PyTorch expression 的加速比，见第 3、4 节 |
 | 精度结论可疑 | 精度参考是 CPU 上的 SciPy（见 1.5 节）。想对照 torch 的结论：`FLAGSPARSE_ACCURACY_REFERENCE=torch` 再跑一次 |
 | ctest 配置在 XPU 处停下 | 预期行为，见第 5 节。等 `deps/libtriton_jit` 出现 `cmake/BackendXPU.cmake` |
 
@@ -220,7 +230,7 @@ CSV 的 `status` 只有两种：`PASS`（跑通了）或 `ERROR`（带 `reason`�
 
 ## 6. 首次上机时按这个顺序走
 
-1. 第 1 节的自检 —— `backend=xpu` 且 `accel device type=xpu` 再往下；
+1. 第 1 节的自检 —— `backend=xpu` 且 `fallback reason=None` 再往下；`torch_xmlir` 路径的 `accel device type=cuda` 正确；
 2. 确认 FlagTree 的 xpu target 能编译执行一个**最小 Triton kernel**（写成真实 .py 文件，
    不要用 stdin，Triton 要读源码；参考 `MACA.md` 2.1 那段）；
 3. 单算子精度：先 `gather` / `scatter`（最简单、无需矩阵文件），再 `spmv_csr`；

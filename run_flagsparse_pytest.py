@@ -112,6 +112,28 @@ STATUS_TO_FLAGGEMS = {
     # Emitted by capi/tools/write_summary.py; kept here so the two tables match.
     "NoBaseline": "NoBaseline",
 }
+# Benchmark arguments that narrow each delivery parent's default CSV sweep to
+# what the delivery variants actually name: int32 indices and the `non` op. The
+# default sweeps also cover int64 and trans/conj (spmm_csr: 720 rows, 120 of
+# them delivery), which on MetaX C550 ran past a 900 s --timeout. Injected only
+# under --delivery-only, BEFORE --benchmark-args/--op-benchmark-args, so an
+# explicit user flag still wins (argparse keeps the last value). Parents absent
+# here already sweep only delivery axes (sddmm_csr, spgemm_csr, spsm_csr).
+DELIVERY_BENCHMARK_ARGS: dict[str, tuple[str, ...]] = {
+    "gather": (
+        "--index-dtypes",
+        "int32",
+        "--value-dtypes",
+        "float16,float32,float64,complex64,complex128",
+    ),
+    "scatter": ("--index-dtypes", "int32"),
+    "spmv_csr": ("--index-dtype", "int32", "--ops", "non"),
+    "spmv_coo": ("--index-dtypes", "int32", "--ops", "non"),
+    "spmm_csr": ("--index-dtypes", "int32", "--ops", "non"),
+    "spmm_coo": ("--index-dtypes", "int32"),
+    "spsv_csr": ("--index-dtypes", "int32", "--ops", "NON"),
+    "spsv_coo": ("--index-dtypes", "int32", "--ops", "NON"),
+}
 PYTEST_STATUS_TO_FLAGGEMS = {
     "PASSED": "Passed",
     "FAILED": "Failed",
@@ -524,12 +546,9 @@ GENERIC_BENCHMARK_BACKENDS: tuple[str, ...] = ("cuda", "rocm", "metax", "mthread
 PROBE_ONLY_BACKENDS: tuple[str, ...] = ("gcu", "mlu")
 
 # The XPU SDK has no cuSPARSE-shaped generic sparse API, so these five run
-# through benchmark_xpu.py instead of the probe: it executes the kernel and
-# times it. Despite the name it records NO baseline -- the delivered script
-# builds a PyTorch-XPU reference closure per operator but never calls it, so
-# the pytorch_ms / speedup / max_abs_err columns come back empty and `status`
-# is PASS or ERROR. Treat this as latency plus an execution check, not a
-# comparison; the name matches the drop so the next one still diffs cleanly.
+# through benchmark_xpu.py instead of the probe.  The script compares each
+# FlagSparse result with an equivalent PyTorch-XPU expression and reports both
+# latencies and their ratio; it is not a vendor/XDNN sparse-library comparison.
 XPU_BASELINE_OPS: tuple[str, ...] = (
     "gather",
     "scatter",
@@ -589,6 +608,10 @@ def _xpu_baseline_command(op: str) -> tuple[str, ...]:
         op,
         "--device",
         "{device}",
+        # XPU baselines are isolated one matrix per subprocess by
+        # _run_bell_per_matrix(), so `{input}` is a file on this path.
+        "--matrix",
+        "{input}",
         "--csv-summary",
         "{csv}",
         "--warmup",
@@ -1520,6 +1543,13 @@ def run_accuracy(
     if not marker:
         return _not_configured(op, "accuracy", "no pytest marker mapping")
 
+    accuracy_env = _base_env(project_root, gpu_id)
+    # XPU correctness is always evaluated against the CPU SciPy oracle.  This is
+    # deliberately independent of the GPU-side PyTorch expression timed by the
+    # performance phase.
+    if os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower() == "xpu":
+        accuracy_env["FLAGSPARSE_ACCURACY_REFERENCE"] = "scipy"
+
     result_path = op_dir / "accuracy_result.json"
     if result_path.exists():
         result_path.unlink()
@@ -1551,7 +1581,7 @@ def run_accuracy(
         returncode, stdout, stderr, duration, timed_out = run_subprocess(
             cmd,
             project_root=project_root,
-            env=_base_env(project_root, gpu_id),
+            env=accuracy_env,
             timeout=timeout,
         )
         stdout_path = op_dir / "accuracy_stdout.log"
@@ -1607,7 +1637,7 @@ def run_accuracy(
     returncode, stdout, stderr, duration, timed_out = run_subprocess(
         cmd,
         project_root=project_root,
-        env=_base_env(project_root, gpu_id),
+        env=accuracy_env,
         timeout=timeout,
     )
     output = stdout + ("\n" if stdout and stderr else "") + stderr
@@ -2303,8 +2333,13 @@ def run_performance(
     if not template:
         return _not_configured(op, "performance", "no performance command mapping")
 
+    # _base_env exposes exactly one physical accelerator to each child.  XPU's
+    # CUDA shim therefore sees that accelerator as cuda:0, regardless of the
+    # physical id selected by --gpus.
+    script_device = 0 if backend == "xpu" else gpu_id
+
     if (
-        op in PER_MATRIX_PERFORMANCE_OPS
+        (op in PER_MATRIX_PERFORMANCE_OPS or (backend == "xpu" and op in XPU_BASELINE_OPS))
         and benchmark_input is not None
         and benchmark_input.is_dir()
     ):
@@ -2312,6 +2347,7 @@ def run_performance(
             project_root=project_root,
             op=op,
             gpu_id=gpu_id,
+            script_device=script_device,
             template=template,
             op_dir=op_dir,
             benchmark_input=benchmark_input,
@@ -2332,7 +2368,7 @@ def run_performance(
         warmup=warmup,
         iters=iters,
         op=op,
-        device=gpu_id,
+        device=script_device,
         extra_args=extra_args,
     )
     returncode, stdout, stderr, duration, timed_out = run_subprocess(
@@ -2426,6 +2462,7 @@ def _run_bell_per_matrix(
     project_root: Path,
     op: str,
     gpu_id: int,
+    script_device: int,
     template: tuple[str, ...],
     op_dir: Path,
     benchmark_input: Path,
@@ -2463,7 +2500,7 @@ def _run_bell_per_matrix(
             warmup=warmup,
             iters=iters,
             op=op,
-            device=gpu_id,
+            device=script_device,
             extra_args=extra_args,
         )
         commands.append(cmd)
@@ -2556,7 +2593,14 @@ def _run_bell_per_matrix(
         result.update(summarize_performance_csv(csv_path, rows=rows, **filter_metadata))
         parsed = parse_performance_json(op, result_path)
         result.update(parsed)
-        result["status"] = status
+        if (
+            status == "PASS"
+            and Path(template[0]).name
+            in {"benchmark_ascend_probe.py", "benchmark_xpu.py"}
+        ):
+            result["status"] = _capability_probe_status(rows)
+        else:
+            result["status"] = status
         result["data_file"] = str(result_path.relative_to(op_dir.parent))
     return result
 
@@ -2812,11 +2856,55 @@ def _delivery_accuracy_phase(
     return projected
 
 
+def _uses_generic_benchmark_script(op: str) -> bool:
+    """Whether run_performance will launch the op's own tests/test_*.py script.
+
+    DELIVERY_BENCHMARK_ARGS are flags of those scripts. XPU, the probe backends
+    and some Ascend entries run a different script that would reject them, so
+    the delivery narrowing must not reach those commands.
+    """
+    config = OP_TEST_CONFIGS.get(op)
+    if config is None or not config.performance_cmd:
+        return False
+    backend = os.environ.get("FLAGSPARSE_BACKEND", "").strip().lower()
+    if backend == "ascend":
+        template = ASCEND_PERFORMANCE_COMMANDS.get(op)
+        return bool(template) and template[0] == config.performance_cmd[0]
+    return not backend or backend in GENERIC_BENCHMARK_BACKENDS
+
+
+def _is_delivery_performance_row(row: dict[str, str]) -> bool:
+    """True for a CSV row on the delivery axes: int32 indices, `non` op.
+
+    Columns a benchmark does not write are not constraints. Without this filter
+    a variant named ..._int_non averaged its int64 and trans/conj rows in too.
+    """
+    index_dtype = str(_row_value(row, "index_dtype") or "").strip().lower()
+    if index_dtype and index_dtype.replace("torch.", "") != "int32":
+        return False
+    for key in ("op", "opA"):
+        op = str(_row_value(row, key) or "").strip().lower()
+        if op and op != "non":
+            return False
+    transpose = str(_row_value(row, "transpose") or "").strip().lower()
+    return transpose not in {"true", "1"}
+
+
 def _delivery_performance_phase(
     phase_result: dict[str, object], dtype: str
 ) -> dict[str, object]:
-    """Restrict CSV-derived performance data to one delivery dtype."""
-    data = _strict_flag_gems_perf_data(phase_result.get("data"))
+    """Restrict CSV-derived performance data to one delivery variant."""
+    records = phase_result.get("records")
+    delivery_rows = None
+    if isinstance(records, list) and records:
+        delivery_rows = [
+            row
+            for row in records
+            if isinstance(row, dict) and _is_delivery_performance_row(row)
+        ]
+        data = _strict_flag_gems_perf_data(_flaggems_perf_data(delivery_rows))
+    else:
+        data = _strict_flag_gems_perf_data(phase_result.get("data"))
     selected = {
         key: value
         for key, value in data.items()
@@ -2828,6 +2916,10 @@ def _delivery_performance_phase(
         )
     result = dict(phase_result)
     result["data"] = selected
+    if delivery_rows is not None:
+        result["records"] = delivery_rows
+        result["delivery_row_count"] = len(delivery_rows)
+        result["non_delivery_row_count"] = len(records) - len(delivery_rows)
     return result
 
 
@@ -3659,7 +3751,10 @@ def main(
             "Run exactly the operators the delivery report has rows for: the "
             "parents of conf/operators.yaml's delivery_variants, or the "
             "reporting: delivery entries of a C API manifest. Ignored by "
-            "--ops and --op-list."
+            "--ops and --op-list. Also narrows each benchmark sweep to the "
+            "delivery axes (int32 indices, `non` op; see "
+            "DELIVERY_BENCHMARK_ARGS); explicit --benchmark-args / "
+            "--op-benchmark-args still override."
         ),
     )
     parser.add_argument(
@@ -3783,6 +3878,26 @@ def main(
         if include_performance_args and args.benchmark_args
         else []
     )
+    if args.delivery_only and include_performance_args:
+        # Fold the global args into each op's list so the delivery defaults can
+        # sit in front of both: explicit --benchmark-args/--op-benchmark-args win.
+        for op in ops:
+            defaults = (
+                DELIVERY_BENCHMARK_ARGS.get(op, ())
+                if _uses_generic_benchmark_script(op)
+                else ()
+            )
+            op_benchmark_args[op] = [
+                *defaults,
+                *extra_benchmark_args,
+                *op_benchmark_args.get(op, []),
+            ]
+            if defaults:
+                print(
+                    f"delivery-only: {op} benchmark narrowed with {' '.join(defaults)}",
+                    flush=True,
+                )
+        extra_benchmark_args = []
     env_info = collect_env_info(project_root)
 
     tasks = {gpu: [] for gpu in gpus}

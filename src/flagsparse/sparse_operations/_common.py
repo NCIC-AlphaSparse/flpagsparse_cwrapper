@@ -235,6 +235,39 @@ def _vendor_plugin_present(spec):
     return False
 
 
+def _vendor_accel_available(spec):
+    """Whether a vendor namespace can actually allocate work on this host."""
+    if not spec.torch_namespace:
+        return True
+    namespace = getattr(torch, spec.torch_namespace, None)
+    if namespace is None:
+        return False
+    is_available = getattr(namespace, "is_available", None)
+    if is_available is None:
+        return True
+    try:
+        return bool(is_available())
+    except Exception:
+        # A few vendor extensions do not make this probe safe before their
+        # runtime is initialized; preserve their historical allocation path.
+        return True
+
+
+def _xpu_cuda_shim_present(spec):
+    """Whether FlagTree's Kunlunxin plugin presents XPU through torch.cuda."""
+    if spec is None or spec.name != "xpu":
+        return False
+    # torch_xmlir can be installed on a CUDA host as well.  It only redirects
+    # torch.cuda calls to Kunlunxin when FlagTree selects its XPU backend.
+    if os.environ.get("FLAGTREE_BACKEND", "").strip().lower() != "xpu":
+        return False
+    try:
+        importlib.import_module("torch_xmlir")
+        return True
+    except Exception:
+        return False
+
+
 def _detect_backend_by_spec(name):
     """Is `name` the backend this process is running on?
 
@@ -322,6 +355,7 @@ __all__ = (
     "_is_maca_runtime",
     "_is_mthreads_runtime",
     "_is_ascend_runtime",
+    "_is_xpu_runtime",
     "_resolve_accel",
     "_accel_module",
     "_accel_fallback_reason",
@@ -784,9 +818,18 @@ def _resolve_accel():
     """
     name = _backend_name()
     spec = _BACKEND_SPEC_BY_NAME.get(name)
+    if _xpu_cuda_shim_present(spec):
+        # FlagTree's Kunlunxin stack is torch_xmlir: it rewrites torch.cuda
+        # calls onto XPU. Native torch.xpu is an unsupported stub in this build.
+        return torch.cuda, "cuda"
     # cuda / rocm / metax carry no namespace of their own: they all answer to
     # torch.cuda, which is why the registry leaves torch_namespace unset for them.
-    if spec is not None and spec.torch_namespace and _vendor_plugin_present(spec):
+    if (
+        spec is not None
+        and spec.torch_namespace
+        and _vendor_plugin_present(spec)
+        and _vendor_accel_available(spec)
+    ):
         mod = getattr(torch, spec.torch_namespace, None)
         if mod is not None:
             # The namespace name doubles as the torch device type for every
@@ -824,22 +867,35 @@ def _accel_fallback_reason():
         return None
     if spec.torch_namespace == "cuda":
         return None
+    if _xpu_cuda_shim_present(spec):
+        try:
+            if torch.cuda.is_available():
+                return None
+        except Exception:
+            pass
+        return (
+            "backend 'xpu' selected but torch_xmlir's CUDA shim reports no "
+            "available device; falling back to torch.cuda"
+        )
     # The namespace alone is not evidence, for the same reason detection does not
     # take it: upstream PyTorch ships torch.xpu for Intel GPUs, so a box with no
     # Kunlunxin plugin answers getattr(torch, "xpu") and this check stayed silent
     # while every kernel ran on CUDA under the name "xpu".
     has_namespace = getattr(torch, spec.torch_namespace, None) is not None
     has_plugin = _vendor_plugin_present(spec) if spec.plugin_modules else True
-    if has_namespace and has_plugin:
+    has_device = _vendor_accel_available(spec) if has_namespace else False
+    if has_namespace and has_plugin and has_device:
         return None
     plugins = " or ".join(spec.plugin_modules) or "its torch plugin"
     if not has_namespace:
         missing = f"torch.{spec.torch_namespace} is unavailable ({plugins} not installed?)"
-    else:
+    elif not has_plugin:
         missing = (
             f"torch.{spec.torch_namespace} exists but {plugins} does not import, "
             "so the namespace belongs to some other vendor"
         )
+    else:
+        missing = f"torch.{spec.torch_namespace} reports no available device"
     return f"backend {name!r} selected but {missing}; falling back to torch.cuda"
 
 

@@ -321,6 +321,13 @@ FLAGSPARSE_SPSV_SMBLK_KERNEL=rowprog python -m pytest tests/pytest -q -m "spsv_c
 排查这个内核时**必须**加 `CUDA_LAUNCH_BLOCKING=1` —— 非法访存是异步上报的，默认会在
 下一次同步（通常是 `allclose`）才抛出，traceback 指向完全无关的位置。
 
+**不要用 CPU 求解顶替。** 2026-09-18 曾在 `_execute_spsv_csr_plan()` 前试过
+`_maca_spsv_cpu_fallback()`（拷到 CPU、调 `scipy.sparse.linalg.spsolve_triangular()`、再拷回），
+已完全撤销：被测的 GPU 算子被换成了 CPU 计算，精度结论不反映 C550 内核，耗时里又混进了
+CPU 求解和 host/device 拷贝。设备内核崩溃或挂死时，结果应如实记为 `Error` / `Timeout` /
+`NotFound`。精度测试里的 SciPy **参考解**（`tests/pytest/accuracy_utils.py` 的
+`scipy_triangular_solve()`）是另一回事：它只算 oracle，被测算子仍在设备上跑。
+
 ---
 
 ## 6. SpMM COO 复数：私有内存 4 KB 上限
@@ -466,6 +473,70 @@ PYTHONPATH=src python -u run_flagsparse_pytest.py --phase both --mode normal --g
 ```
 
 该命令在前台运行；如需脱离终端，可由调用方以 `setsid` 或 `tmux` 包裹，命令本身不依赖后台参数。
+
+### 7.4 交付性能：只跑交付范围（2026-09-18 实测）
+
+7.1–7.3 是**全量** sweep。交付的 40 个变体只要 `int32` 索引和 `non` 操作，而默认 sweep 远大于此，
+`--timeout 900`（每个父算子每个阶段）下实测跑不完：
+
+| 父算子 | 默认 CSV sweep | 900 秒内进度 | 推断全量耗时 |
+|---|---|---|---|
+| `sddmm_csr` | 2 dtype × 4 K × 30 = 240 组 | 59/240 | ≥ 3660 秒 |
+| `spmm_csr` | 4 dtype × 2 index × 3 op × 30 = 720 组 | 252/720 | ≥ 2570 秒 |
+
+不是单个矩阵挂死，是 sweep 本身太大。把 sweep 收窄到交付范围，而不是盲目加 timeout。
+
+**现在 `--delivery-only` 会自动收窄**（2026-09-18 起，见 `run_flagsparse_pytest.py` 的
+`DELIVERY_BENCHMARK_ARGS`）：spmv/spmm/spsv 只跑 `int32` + `non`，gather/scatter 只跑 `int32`
+和交付 dtype，启动时每个被收窄的算子会打印一行 `delivery-only: <op> benchmark narrowed with ...`。
+所以 C550 上交付性能只需要：
+
+```bash
+setsid env PYTHONPATH="$PWD/src" FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_VENDOR=none \
+  timeout -s KILL 7200 python3 -u run_flagsparse_pytest.py \
+  --phase performance --mode normal --delivery-only --gpus 0 --timeout 1200 \
+  --benchmark-input /root/gcx/matrix --benchmark-warmup 5 --benchmark-iters 20 \
+  --benchmark-args=--no-cusparse \
+  --results-dir pytest_results_metax_delivery_perf_w5_i20 \
+  > pytest_results_metax_delivery_perf_w5_i20.log 2>&1 < /dev/null &
+```
+
+`sddmm_csr` 的 K sweep（32/64/128/256）**不在**自动收窄范围内：交付名里没有 K，自动砍掉会改变
+报出来的均值口径。要只跑一个 K，仍像下面那样显式传 `--op-benchmark-args='sddmm_csr=--k 64'`。
+
+下面是自动收窄之前本机实际跑的命令（手写 `--op-benchmark-args`），结果即出自它：
+
+```bash
+setsid env PYTHONPATH="$PWD/src" FLAGSPARSE_BACKEND=metax FLAGSPARSE_MACA_VENDOR=none \
+  timeout -s KILL 3600 python3 -u run_flagsparse_pytest.py \
+  --phase performance --mode normal --delivery-only --gpus 0 --timeout 1200 \
+  --ops spmm_csr,sddmm_csr \
+  --benchmark-input /root/gcx/matrix --benchmark-warmup 5 --benchmark-iters 20 \
+  --benchmark-args=--no-cusparse \
+  --op-benchmark-args='spmm_csr=--dtypes float32,float64,complex64,complex128 --index-dtypes int32 --ops non' \
+  --op-benchmark-args='sddmm_csr=--dtype float32,float64 --index-dtype int32 --k 64' \
+  --results-dir pytest_results_metax_delivery_perf_remaining_w5_i20 \
+  > pytest_results_metax_delivery_perf_remaining_w5_i20/runner.log 2>&1 < /dev/null &
+```
+
+结果：`spmm_csr` 120 行（4 dtype × 30 矩阵）、`sddmm_csr` 60 行（2 dtype × 30 矩阵），两项都
+`Passed`，没有触发 1200 秒或 3600 秒超时：
+
+| 交付变体 | 矩阵数 | 加速比（**对 PyTorch**，CSV `base/gems` 均值） |
+|---|---:|---:|
+| `sddmm_csr_f32_int_non_non_row` | 30 | 7.45x |
+| `sddmm_csr_f64_int_non_non_row` | 30 | 5.92x |
+| `spmm_csr_f32_int_non_non_row` | 30 | 20.88x |
+| `spmm_csr_f64_int_non_non_row` | 30 | 13.81x |
+| `spmm_csr_c32_int_non_non_row` | 30 | 10.24x |
+| `spmm_csr_c64_int_non_non_row` | 30 | 5.14x |
+
+**这些数的分母是 PyTorch，不是厂商稀疏库**（`--no-cusparse`，C550 上没有可用的 mcSPARSE
+基线），不能和 CUDA/MUSA 那些对 cuSPARSE/muSPARSE 的数字放在一起比。
+
+仍要跑默认全量 sweep 的话，两者分开跑：`sddmm_csr --timeout 4500`、`spmm_csr --timeout 3600`，
+外层 `timeout -s KILL` 要大于对应的单项 timeout；不要把两者串在一条 7200 秒的外层命令里，
+否则外层会先杀掉后一个。
 
 ---
 

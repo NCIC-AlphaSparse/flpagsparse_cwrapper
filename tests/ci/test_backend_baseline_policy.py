@@ -255,3 +255,36 @@ def test_every_out_of_tree_backend_reports_its_own_fallback():
             text=True,
         )
         assert not out.stdout.strip(), f"{backend}: unexpected fallback warning"
+
+
+def test_fallback_reason_requires_an_available_vendor_device(monkeypatch):
+    """A loaded plugin alone must not bless an unusable device namespace."""
+    from flagsparse.sparse_operations import _common
+
+    class UnavailableXPU:
+        @staticmethod
+        def is_available():
+            return False
+
+    monkeypatch.setattr(_common, "_backend_name", lambda: "xpu")
+    monkeypatch.setattr(_common, "_vendor_plugin_present", lambda spec: True)
+    monkeypatch.setattr(_common, "_xpu_cuda_shim_present", lambda spec: False)
+    monkeypatch.setattr(_common.torch, "xpu", UnavailableXPU())
+
+    assert _common._resolve_accel() == (_common.torch.cuda, "cuda")
+    reason = _common._accel_fallback_reason()
+    assert reason is not None
+    assert "xpu" in reason
+    assert "no available device" in reason
+
+
+def test_torch_xmlir_xpu_uses_the_cuda_shim(monkeypatch):
+    """FlagTree's XPU plugin deliberately exposes its accelerator as CUDA."""
+    from flagsparse.sparse_operations import _common
+
+    monkeypatch.setattr(_common, "_backend_name", lambda: "xpu")
+    monkeypatch.setattr(_common, "_xpu_cuda_shim_present", lambda spec: True)
+    monkeypatch.setattr(_common.torch.cuda, "is_available", lambda: True)
+
+    assert _common._resolve_accel() == (_common.torch.cuda, "cuda")
+    assert _common._accel_fallback_reason() is None

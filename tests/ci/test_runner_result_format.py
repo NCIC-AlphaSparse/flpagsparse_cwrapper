@@ -698,3 +698,36 @@ def test_operator_speedup_prefers_the_vendor_column(tmp_path):
     )
     summary = runner.summarize_performance_csv(csv_path)
     assert summary["speedup"] == 2.0
+
+
+def test_delivery_projection_keeps_only_int32_non_rows_with_a_speedup():
+    # A variant named ..._int_non used to average int64 and trans/conj rows in,
+    # and rows without a speedup counted as 0 (spsm f32 on CUDA: 8.9x read 3.8x).
+    header = "matrix,value_dtype,index_dtype,op,triton_ms,cusparse_ms,"
+    header += "triton_speedup_vs_cusparse,status"
+    lines = [
+        "a.mtx,float32,int32,non,1.0,2.0,2.0,PASS",
+        "b.mtx,float32,int32,non,1.0,4.0,4.0,PASS",
+        "c.mtx,float32,int32,non,1.0,,,PASS",
+        "a.mtx,float32,int64,non,1.0,50.0,50.0,PASS",
+        "a.mtx,float32,int32,trans,1.0,90.0,90.0,PASS",
+    ]
+    rows = list(csv.DictReader([header, *lines]))
+    phase = {"records": rows, "data": runner._flaggems_perf_data(rows)}
+    projected = runner._delivery_performance_phase(phase, "f32")
+    assert projected["delivery_row_count"] == 3
+    assert projected["non_delivery_row_count"] == 2
+    assert projected["data"]["fp32"]["speedup"] == 3.0
+
+
+def test_delivery_benchmark_args_name_flags_the_scripts_accept():
+    delivery_parents = {
+        variant["operator"]
+        for variant in load_delivery_variants(ROOT / "conf" / "operators.yaml")
+    }
+    assert set(runner.DELIVERY_BENCHMARK_ARGS) <= delivery_parents
+    for op, args in runner.DELIVERY_BENCHMARK_ARGS.items():
+        script = ROOT / runner.OP_TEST_CONFIGS[op].performance_cmd[0]
+        source = script.read_text(encoding="utf-8")
+        for flag in (arg for arg in args if arg.startswith("--")):
+            assert f'"{flag}"' in source, f"{script.name} has no {flag}"
