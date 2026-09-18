@@ -463,7 +463,7 @@ python3 run_flagsparse_split_delivery.py \
   --results-dir pytest_results_mthreads_split_20260917
 ```
 
-MTT S5000 实测：CMake 从零配置成功（`ctest baseline: MUSA -> /usr/local/musa/lib/libmusparse.so`），`cmake --build` 73/73 全部编译链接成功，Python 精度（normal 模式，非 quick）**40/40 变体 `accuracy: Passed`**——含第 12 节刚修的 `sddmm_csr`。性能半边（C API `ctest -R benchmark`）在本文档更新时仍在跑，结果另行回填。
+MTT S5000 实测：CMake 从零配置成功（`ctest baseline: MUSA -> /usr/local/musa/lib/libmusparse.so`），`cmake --build` 73/73 全部编译链接成功，Python 精度（normal 模式，非 quick）**40/40 变体 `accuracy: Passed`**——含第 12 节刚修的 `sddmm_csr`。性能半边（C API `ctest -R benchmark`）2026-09-18 09:15 跑完，完整结果见第 13 节。
 
 ### 在别的机器上复现这轮改动
 
@@ -482,3 +482,75 @@ python3 run_flagsparse_split_delivery.py \
 前提条件（见第 10 节）：`capi/ctest/baseline/CMakeLists.txt` 那处 `BACKEND` 变量名修复必须在；目标机器要有对应厂商的稀疏库（本机是 `/usr/local/musa/lib/libmusparse.so` + `musparse.h`），否则 `configure_and_build_capi()` 里的 `cmake` 步骤会正常跑完但 `ctest baseline:` 打出 `<BACKEND> -> none`，性能那边就是空的（这不是 bug，是如实反映没有基线，参见第 4 节的三态表 WIRED/PROBED/SEAM/NONE）。
 
 **以下几个不在这轮要合并的改动里，是本机这次会话调试用的临时产物，不要跟着传**：`scratchpad_run_musa_full.sh`（已被 `run_flagsparse_split_delivery.py` 取代，可以删了）、`musa_full_run_20260917.log`、`run_flagsparse_split_delivery_20260917.log`（跑批日志，`.gitignore` 没覆盖但不该提交）、`node_modules/`、`package.json`、`package-lock.json`（这三个是这台机器上装 `@anthropic-ai/claude-code` 这个 CLI 工具自己留下的，跟 FlagSparse 无关）。
+
+## 13. 2026-09-18：真机完整实测结果（精度 pytest + 性能 muSPARSE），以及 `write_summary.py` 把"没基线"错判成"Skipped"
+
+`rm -rf capi/build` 之后跑 `python3 run_flagsparse_split_delivery.py --mode normal --benchmark-input /root/gcx/matrix --timeout 3600 --results-dir pytest_results_mthreads_split_20260917`，2026-09-18 09:15:41 跑完（`summary_split.json`）。同一天上游 `03a8e74 list completed` 把 `conf/operators.yaml` 的交付清单标注为 **42 条**（本节仍按当前已注册的 40 条报，缺的 `sddmm_csr_c32/c64_int_non_non_row` 等复数 SDDMM 内核落地）：
+
+| 变体 | 精度 | 性能 | 加速比（FlagSparse / muSPARSE） |
+|---|---|---|---|
+| `gather_f16_int` | Passed | **见下方订正，不是真 Skipped** | — |
+| `gather_f32_int` | Passed | Passed | 0.836x |
+| `gather_f64_int` | Passed | Passed | 0.833x |
+| `gather_c32_int` | Passed | Passed | 0.840x |
+| `gather_c64_int` | Passed | Passed | 0.849x |
+| `scatter_f16_int` | Passed | **见下方订正，不是真 Skipped** | — |
+| `scatter_f32_int` | Passed | Passed | 0.979x |
+| `scatter_f64_int` | Passed | Passed | 0.982x |
+| `scatter_c32_int` | Passed | Passed | 0.983x |
+| `scatter_c64_int` | Passed | Passed | 0.984x |
+| `spmv_csr_f32_int_non` | Passed | Passed | 0.324x |
+| `spmv_csr_f64_int_non` | Passed | Passed | 0.347x |
+| `spmv_csr_c32_int_non` | Passed | Passed | 0.270x |
+| `spmv_csr_c64_int_non` | Passed | Passed | 0.290x |
+| `spmv_coo_f32_int_non` | Passed | Passed | **3.257x** |
+| `spmv_coo_f64_int_non` | Passed | Passed | **3.080x** |
+| `spmv_coo_c32_int_non` | Passed | Passed | **2.834x** |
+| `spmv_coo_c64_int_non` | Passed | Passed | **2.591x** |
+| `spmm_csr_f32_int_non_non_row` | Passed | Passed | 0.480x |
+| `spmm_csr_f64_int_non_non_row` | Passed | Passed | 0.417x |
+| `spmm_csr_c32_int_non_non_row` | Passed | Passed | 0.480x |
+| `spmm_csr_c64_int_non_non_row` | Passed | Passed | 0.118x |
+| `spmm_coo_f32_int_non_non_row` | Passed | Passed | 0.866x |
+| `spmm_coo_f64_int_non_non_row` | Passed | Passed | 0.976x |
+| `spmm_coo_c32_int_non_non_row` | Passed | Passed | 0.887x |
+| `spmm_coo_c64_int_non_non_row` | Passed | Passed | 1.037x |
+| `sddmm_csr_f32_int_non_non_row` | Passed | Passed | **16.211x** |
+| `sddmm_csr_f64_int_non_non_row` | Passed | Passed | **30.773x** |
+| `spgemm_csr_f32_int_non_non` | Passed | **NotFound**（24.24s 崩，Triton） | — |
+| `spgemm_csr_f64_int_non_non` | Passed | **NotFound**（同上） | — |
+| `spsm_csr_f32_int_non_non_row` | Passed | **NotFound**（3600s Timeout） | — |
+| `spsm_csr_f64_int_non_non_row` | Passed | **NotFound**（同上） | — |
+| `spsv_csr_f32_int_non` | Passed | **NotFound**（247.97s 崩，Triton） | — |
+| `spsv_csr_f64_int_non` | Passed | **NotFound**（同上） | — |
+| `spsv_csr_c32_int_non` | Passed | **NotFound**（同上） | — |
+| `spsv_csr_c64_int_non` | Passed | **NotFound**（同上） | — |
+| `spsv_coo_f32_int_non` | Passed | **NotFound**（同上，spsv 是一个 GTest 循环 30 矩阵，第一个矩阵就崩，csr/coo 共用同一次崩溃） | — |
+| `spsv_coo_f64_int_non` | Passed | **NotFound**（同上） | — |
+| `spsv_coo_c32_int_non` | Passed | **NotFound**（同上） | — |
+| `spsv_coo_c64_int_non` | Passed | **NotFound**（同上） | — |
+
+**汇总**：精度 **40/40 Passed**；性能 26 Passed（其中 `sddmm_csr` 16-31x、`spmv_coo` 2.6-3.3x 明显快于 muSPARSE，`spmv_csr` 0.27-0.35x、`spmm_csr` 0.12-0.48x 反而比 muSPARSE 慢，`spmm_csr_c64` 只有 0.118x）/ 2 条曾误判 Skipped（订正见下）/ 12 条 NotFound（`spgemm`/`spsv` 是 Triton JIT 编译问题崩溃，`spsm` 是真的卡到 3600s 超时，两类原因不同，不要混为一谈）。
+
+### `gather_f16`/`scatter_f16` 不是"没测"，是"测了、过了，只是没基线"——`write_summary.py` 的聚合把这个情况错判成 Skipped
+
+一开始报成"性能 Skipped"，用户追问"fp16 是交付 dtype 吗、本机支不支持"，查了原始数据才发现完全测出来了：
+
+```json
+// capi/build/bench_mthreads_split/gather_benchmark.json，30 行里随手一行
+{
+  "name": "gather_spvec_f16_2cubes_sphere",
+  "status": "ok",
+  "accuracy": "pass",
+  "median_ms": 0.032707,
+  "baseline_status": "failed",
+  "baseline_detail": "muSPARSE: Gather dtype unsupported",
+  "speedup": null
+}
+```
+
+`gather_f16`/`scatter_f16` 各 30 个矩阵，**`status` 全部 `ok`、`accuracy` 全部 `pass`，有真实执行时间**（gather 0.032-0.091ms，scatter 0.033-0.226ms）。唯一的问题是 **muSPARSE 本身不支持 fp16 的 gather/scatter**（`baseline_detail` 写得很明确），不是 MUSA/FlagSparse 跑不了，`speedup` 算不出来纯粹是因为分母缺失。
+
+`capi/tools/write_summary.py` 把这种"每一行 `base` 都是 0（没有基线）"的 dtype 聚合成 `"result": "Unknown"`，投影到变体级别时被归到 `"status": "Skipped"`——和 Python 侧第 8 节发现的"NotFound 混淆了跑崩/跑不完/真不支持"是**同一类根因**：聚合逻辑只有"有基线能算出 speedup"和"没有"两态，没有把"内核本身完全正常、只是没基线可比"单独分类，于是被压缩成了和"真的没跑"外观一样的状态。
+
+**这轮没有改 `write_summary.py`**（工作量超出这轮范围，且需要想清楚新状态叫什么、Python 侧 summary.json 的 schema 要不要跟着加，属于第 9 节说的"跨后端共用代码，举证责任不在单个后端"那一类），只在这里记录清楚，供下一轮或者其他后端一起改：**读这份数据的人，见到 `performance.status == "Skipped"` 时，要去原始 `<op>_benchmark.json` 里确认是真跳过还是"没基线"，不能直接当成"这个 dtype 测不了"。**
