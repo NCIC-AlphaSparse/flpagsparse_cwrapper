@@ -67,7 +67,7 @@ def main():
         "--all",
         action="store_true",
         help="include retained variants; default is the delivery "
-        "list only (算子列表注册修改.xlsx)",
+        "list only (registered delivery variants, conf/operators.yaml)",
     )
     ap.add_argument(
         "--by-matrix",

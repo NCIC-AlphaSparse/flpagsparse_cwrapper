@@ -246,7 +246,7 @@ baseline, not this PyTorch CSC baseline. The COO path remains a correctness refe
 | Path | What it is |
 | --- | --- |
 | `src/flagsparse/` | Core package. `sparse_operations/` holds **one shared implementation** per operator; `sparse_operations/backends/<backend>/` is an override layer that is **empty by default**, so only a file that genuinely diverged shows up there |
-| `conf/operators.yaml` | The operator inventory, and the single source of truth for the **40 delivery variants** (`gather_f32_int`, `spmv_csr_f32_int_non`, ...). Both front ends read it through `tools/delivery_variants.py` |
+| `conf/operators.yaml` | The operator inventory, and the single source of truth for the **40 registered delivery variants** (the delivery list has 42; `sddmm_csr` c32/c64 wait for a complex kernel) (`gather_f32_int`, `spmv_csr_f32_int_non`, ...). Both front ends read it through `tools/delivery_variants.py` |
 | `run_flagsparse_pytest.py` | The unified runner: accuracy and performance per operator, writes `summary.json` / `summary.csv` / `result.html` keyed by delivery variant |
 | `tests/pytest/` | Accuracy suites (shared across backends; the golden reference stays on CPU) |
 | `tests/ci/` | Policy and contract tests. No GPU needed |

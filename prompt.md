@@ -74,7 +74,9 @@ python3 run_flagsparse_pytest.py --phase both --mode normal --delivery-only \
 
 唯一真源是 `conf/operators.yaml` 的 `delivery_variants`（40 条，如 `gather_f32_int`、
 `spmv_csr_f32_int_non`），Python 侧和 C API 侧由同一个加载器 `tools/delivery_variants.py`
-读取。跑完 runner 应当得到：
+读取。交付清单本身是 42 个：`sddmm_csr` 的 c32/c64 等复数内核，还没登记，所以现在报告出 40 行。
+gather/scatter 的 f16 是交付变体（xlsx 漏写了），不是清单外的附加项。详见 `capi/docs/README.md`
+"三份文件，三种口径"。跑完 runner 应当得到：
 
 ```
 <结果目录>/summary.json        result 按变体名做键，40 条，schema 与 FlagGems 一致

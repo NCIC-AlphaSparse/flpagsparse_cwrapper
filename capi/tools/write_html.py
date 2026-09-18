@@ -212,7 +212,7 @@ def render(doc, out_path):
 <style>{CSS}</style>
 <h1>FlagSparse C API 测试结果</h1>
 <div class="sub">{esc(doc.get("timestamp", ""))} &nbsp;|&nbsp; 基线 cuSPARSE &nbsp;|&nbsp;
-交付清单 {len(result)} 个变体（算子列表注册修改.xlsx）</div>
+已登记交付变体 {len(result)} 个（conf/operators.yaml delivery_variants）</div>
 
 <table>
 <thead><tr><th>Env</th><th>Setting</th></tr></thead>

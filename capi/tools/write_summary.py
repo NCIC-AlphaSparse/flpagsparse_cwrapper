@@ -193,7 +193,7 @@ def main():
         "--all",
         action="store_true",
         help="include retained variants; the default is the "
-        "delivery list only (算子列表注册修改.xlsx)",
+        "registered delivery variants only (conf/operators.yaml)",
     )
     args = ap.parse_args()
 

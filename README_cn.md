@@ -216,7 +216,7 @@ BSR 脚本会保留已完成的 `PASS`/`FAIL` case、重试此前的 `ERROR` cas
 | 路径 | 是什么 |
 | --- | --- |
 | `src/flagsparse/` | 核心包。`sparse_operations/` 下每个算子只有**一份共享实现**；`sparse_operations/backends/<后端>/` 是**默认为空**的覆盖层，只有真正分叉的文件才会出现在里面 |
-| `conf/operators.yaml` | 算子清单，也是 **40 个交付变体**（`gather_f32_int`、`spmv_csr_f32_int_non` …）的单一真源。Python 侧和 C API 侧都通过 `tools/delivery_variants.py` 读它 |
+| `conf/operators.yaml` | 算子清单，也是 **40 个已登记交付变体**（交付清单共 42 个，`sddmm_csr` 的 c32/c64 等复数内核）（`gather_f32_int`、`spmv_csr_f32_int_non` …）的单一真源。Python 侧和 C API 侧都通过 `tools/delivery_variants.py` 读它 |
 | `run_flagsparse_pytest.py` | 统一 runner：逐算子跑精度与性能，产出按变体名做键的 `summary.json` / `summary.csv` / `result.html` |
 | `tests/pytest/` | 精度用例（各后端共用；golden reference 恒在 CPU） |
 | `tests/ci/` | 策略与契约测试，不需要 GPU |

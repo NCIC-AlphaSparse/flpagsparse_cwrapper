@@ -61,7 +61,7 @@ ctest --test-dir build -L cuda --output-on-failure
 ## 交付变体清单
 
 Python runner 与本目录的 `tools/write_summary.py` 都读取同一份顶层清单：
-`../conf/operators.yaml` 的 `delivery_variants` 字段。当前清单固定 40 个变体，两个 `summary.json` 的
+`../conf/operators.yaml` 的 `delivery_variants` 字段。当前登记 40 个变体（交付清单共 42 个，`sddmm_csr` 的 c32/c64 等复数内核，见下文"三份文件，三种口径"），两个 `summary.json` 的
 `result` key 集合完全相同。未运行的变体保留 key 并标为 `NotFound`，不从其他 dtype 或
 算子借用结果。后续扩展时先向该清单加入一个带 `id`、`operator`、`format`、`dtype` 的条目，
 再接测试和 benchmark 生产端。
@@ -228,14 +228,22 @@ JIT 里一句 `number of argument mismatch`，两个副本的名字一个都没�
 
 | 文件 | 内容 | 作用 |
 |---|---|---|
-| `算子列表注册修改.xlsx`（仓库外） | 40 个变体，"新算子列表"一列 | **交付口径**，决定报告默认出什么 |
+| `算子列表注册修改.xlsx`（仓库外） | 40 个变体，"新算子列表"一列；**漏了 gather/scatter 的 f16**（见下） | 交付口径的原始来源 |
 | `算子对比结果_合并变体.csv`（仓库外） | 115 个变体，含 trans/conj/col 布局 | 对齐 cuSPARSE 的完整矩阵，未来目标 |
 | `conf/operators.yaml`（本仓库） | 22 个算子组 → 60 个变体 | 实现细节 + 归属标记 |
 
 三个数不是包含关系，别混：**115** 是完整口径（含 `non`/`trans`/`conj` 与 row/col 布局），
-**42** 是当前交付（xlsx 的 40 加上 gather/scatter 的 f16），**60** 是本仓库能生成的变体
-（交付 40 + 保留 20）。42 与 40 差的两个是 `sddmm_csr` 的 c32/c64：交付清单要，但**没有
-复数 SDDMM 内核**（实测 `x dtype must be torch.float32 or torch.float64`）。
+**60** 是本仓库能生成的变体（已登记交付 40 + 保留 20）。
+
+**交付清单是 42 个，已登记、会出报告的是 40 个**，两者的差别说清楚：
+
+| | 个数 | 组成 |
+|---|---|---|
+| 交付清单 | **42** | xlsx 的 40 + `gather_f16_int` + `scatter_f16_int`。xlsx 漏写了这两个 f16，属于清单的笔误（2026-09-18 与需求方确认），它们**是交付算子**，不是清单外的附加项 |
+| 已登记（`delivery_variants`） | **40** | 交付清单 42 − `sddmm_csr_c32_int_non_non_row` − `sddmm_csr_c64_int_non_non_row` |
+| 待补 | **2** | 上面两个 sddmm 复数变体：交付清单要，但**还没有复数 SDDMM 内核**（实测 `x dtype must be torch.float32 or torch.float64`）。内核补上后再在 `delivery_variants` 里登记，报告随之变成 42 行 |
+
+所以现在报告里的"40/40"读作**交付清单 42 个中已实现的 40 个全部通过**，不是"交付清单全部通过"。
 
 ### `reporting` 字段
 

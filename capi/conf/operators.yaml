@@ -325,7 +325,10 @@ operators:
     c_api: [flagsparseSDDMM, flagsparseSDDMM_bufferSize, flagsparseSDDMM_preprocess]
     python_impl: [flagsparse_sddmm_csr, prepare_sddmm_csr]
     formats: [csr]
-    dtypes: [f32, f64]          # the operator package has no complex SDDMM kernel
+    # c32/c64 are in the delivery list but not registered yet: the operator
+    # package has no complex SDDMM kernel. Add them here and to delivery_variants
+    # in conf/operators.yaml when it lands.
+    dtypes: [f32, f64]
     index_types: [int]
     ops: [non, trans]           # for BOTH dense operands; conj pending
     orders: [row, col]
