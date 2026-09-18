@@ -59,13 +59,16 @@ def _random_csr(rows, cols, dtype, device, value_scale=_SYNTHETIC_VALUE_SCALE):
 
 
 def _csr_to_dense(data, indices, indptr, shape):
+    # torch_musa can store CSR tensors but does not register SparseCsrmusa
+    # ``to_dense``. The result is an oracle artifact, so materialize it on the
+    # CPU rather than exercising a second vendor sparse implementation.
     csr = torch.sparse_csr_tensor(
-        indptr,
-        indices,
-        data,
+        indptr.cpu(),
+        indices.cpu(),
+        data.cpu(),
         size=shape,
         dtype=data.dtype,
-        device=data.device,
+        device=golden_device(),
     )
     return csr.to_dense()
 
@@ -104,32 +107,36 @@ def test_spgemm_csr_matches_torch(M, N, K, dtype, indptr_dtype):
 @pytest.mark.spgemm_csr
 def test_spgemm_csr_rejects_unsupported_index_and_value_dtypes():
     device = accelerator_device()
-    A = _random_csr(8, 10, torch.float32, device)
-    B = _random_csr(10, 6, torch.float32, device)
+    # Build the CSR inputs on CPU and upload only the triples: MUSA does not
+    # register a dense-to-CSR conversion, so constructing them on the device
+    # failed before the dtype check this test exists for was ever reached.
+    golden = golden_device()
+    A = _random_csr(8, 10, torch.float32, golden)
+    B = _random_csr(10, 6, torch.float32, golden)
     with pytest.raises(TypeError, match="a_indices dtype must be torch.int32"):
         flagsparse_spgemm_csr(
-            A.values(),
-            A.col_indices().to(torch.int64),
-            A.crow_indices(),
+            A.values().to(device),
+            A.col_indices().to(torch.int64).to(device),
+            A.crow_indices().to(device),
             (8, 10),
-            B.values(),
-            B.col_indices().to(torch.int32),
-            B.crow_indices(),
+            B.values().to(device),
+            B.col_indices().to(torch.int32).to(device),
+            B.crow_indices().to(device),
             (10, 6),
         )
 
-    A_complex = _random_csr(8, 10, torch.complex64, device)
+    A_complex = _random_csr(8, 10, torch.complex64, golden)
     with pytest.raises(
         TypeError, match="a_data dtype must be torch.float32 or torch.float64"
     ):
         flagsparse_spgemm_csr(
-            A_complex.values(),
-            A_complex.col_indices().to(torch.int32),
-            A_complex.crow_indices(),
+            A_complex.values().to(device),
+            A_complex.col_indices().to(torch.int32).to(device),
+            A_complex.crow_indices().to(device),
             (8, 10),
-            B.values(),
-            B.col_indices().to(torch.int32),
-            B.crow_indices(),
+            B.values().to(device),
+            B.col_indices().to(torch.int32).to(device),
+            B.crow_indices().to(device),
             (10, 6),
         )
 
@@ -176,15 +183,19 @@ def test_sddmm_csr_matches_sampled_dense_reference(M, N, K, dtype, indptr_dtype)
 @pytest.mark.sddmm_csr
 def test_sddmm_csr_rejects_unsupported_index_and_value_dtypes():
     device = accelerator_device()
-    pattern = _random_csr(8, 10, torch.float32, device)
-    data = pattern.values()
-    indptr = pattern.crow_indices()
+    # Same fix as the SpGEMM sibling above, which it was missed alongside: build
+    # the pattern on CPU (MUSA registers no aten::_to_sparse_csr) and upload
+    # only the triples the operator actually takes.
+    pattern = _random_csr(8, 10, torch.float32, golden_device())
+    data = pattern.values().to(device)
+    indptr = pattern.crow_indices().to(device)
+    col_indices = pattern.col_indices().to(device)
     x = torch.randn(8, 4, dtype=torch.float32, device=device)
     y = torch.randn(10, 4, dtype=torch.float32, device=device)
     with pytest.raises(TypeError, match="indices dtype must be torch.int32"):
         flagsparse_sddmm_csr(
             data=data,
-            indices=pattern.col_indices().to(torch.int64),
+            indices=col_indices.to(torch.int64),
             indptr=indptr,
             x=x,
             y=y,
@@ -197,7 +208,7 @@ def test_sddmm_csr_rejects_unsupported_index_and_value_dtypes():
     ):
         flagsparse_sddmm_csr(
             data=data_complex,
-            indices=pattern.col_indices().to(torch.int32),
+            indices=col_indices.to(torch.int32),
             indptr=indptr,
             x=x.to(torch.complex64),
             y=y.to(torch.complex64),

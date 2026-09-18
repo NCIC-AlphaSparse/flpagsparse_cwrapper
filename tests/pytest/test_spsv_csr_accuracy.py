@@ -42,6 +42,7 @@ from tests.pytest.accuracy_utils import (
     accelerator_device,
     close_tolerances,
     golden_device,
+    scipy_triangular_solve,
 )
 from tests.pytest.param_shapes import SPSV_N
 
@@ -180,6 +181,26 @@ def _cupy_ref_spsv(A_cp, b_t, *, lower, unit_diagonal=False):
     return x_t.to(b_t.dtype)
 
 
+def _cusparse_or_scipy_ref_spsv(A, A_cp, b, *, lower, op_mode="NON", unit_diagonal=False):
+    """cuSPARSE reference via CuPy when available, else SciPy on the CPU golden ``A``.
+
+    CuPy only ever talks to a real NVIDIA GPU through cuSPARSE, so it is absent on
+    every non-CUDA backend (MUSA, ROCm, MACA, ...). ``scipy_triangular_solve``
+    already existed for exactly this case but sat unused, so these tests
+    unconditionally skipped on non-CUDA machines instead of falling back to it.
+    """
+    if cp is not None and cpx_sparse is not None and cpx_spsolve_triangular is not None:
+        return _cupy_ref_spsv(
+            _cupy_apply_op(A_cp, op_mode),
+            b,
+            lower=_effective_lower_for_op(lower, op_mode),
+            unit_diagonal=unit_diagonal,
+        )
+    return scipy_triangular_solve(
+        A, b, lower=lower, unit_diagonal=unit_diagonal, op=op_mode.lower()
+    )
+
+
 @pytest.mark.spsv
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize(
@@ -188,15 +209,13 @@ def _cupy_ref_spsv(A_cp, b_t, *, lower, unit_diagonal=False):
     ids=["float32", "float64"],
 )
 def test_spsv_csr_lower_matches_dense(n, dtype):
-    # Keep the original baseline test case untouched in semantics.
     device = accelerator_device()
-    base = torch.tril(torch.randn(n, n, dtype=dtype, device=device))
-    eye = torch.eye(n, dtype=dtype, device=device)
+    golden = golden_device()
+    base = torch.tril(torch.randn(n, n, dtype=dtype, device=golden))
+    eye = torch.eye(n, dtype=dtype, device=golden)
     A = base + eye * (float(n) * 0.5 + 2.0)
-    b = torch.randn(n, dtype=dtype, device=device)
-    x_ref = torch.linalg.solve_triangular(
-        A, b.to(A.device).unsqueeze(-1), upper=False
-    ).squeeze(-1)
+    b = torch.randn(n, dtype=dtype, device=golden).to(device)
+    x_ref = _dense_ref_spsv(A, b, lower=True)
     Asp = A.to_sparse_csr()
     data = Asp.values().clone().to(device)
     indices = Asp.col_indices().to(device)
@@ -824,8 +843,11 @@ def test_spsv_csr_explicit_nnz_balance_route_matches_dense():
     device = accelerator_device()
     dtype = torch.float64
     n = 96
-    A = torch.tril(torch.randn(n, n, dtype=dtype, device=device) * 0.02)
-    A = A + torch.eye(n, dtype=dtype, device=device) * 3.0
+    # Dense-to-CSR on the CPU: MUSA registers no aten::_to_sparse_csr, and only
+    # the triples below need to be on the accelerator.
+    golden = golden_device()
+    A = torch.tril(torch.randn(n, n, dtype=dtype, device=golden) * 0.02)
+    A = A + torch.eye(n, dtype=dtype, device=golden) * 3.0
     b = _rand_like(dtype, (n,), device)
     Asp = A.to_sparse_csr()
 
@@ -849,8 +871,11 @@ def test_spsv_csr_explicit_nnz_balance_analysis_builds_backend_metadata():
     device = accelerator_device()
     dtype = torch.float64
     n = 96
-    A = torch.tril(torch.randn(n, n, dtype=dtype, device=device) * 0.02)
-    A = A + torch.eye(n, dtype=dtype, device=device) * 3.0
+    # Dense-to-CSR on the CPU: MUSA registers no aten::_to_sparse_csr, and only
+    # the triples below need to be on the accelerator.
+    golden = golden_device()
+    A = torch.tril(torch.randn(n, n, dtype=dtype, device=golden) * 0.02)
+    A = A + torch.eye(n, dtype=dtype, device=golden) * 3.0
     Asp = A.to_sparse_csr()
     descr = flagsparse_spsv_analysis_csr(
         Asp.values().clone().to(device),
@@ -1108,8 +1133,11 @@ def test_spsv_csr_nnz_balance_analysis_workspace_solve_matches_direct():
     device = accelerator_device()
     dtype = torch.float64
     n = 96
-    A = torch.tril(torch.randn(n, n, dtype=dtype, device=device) * 0.02)
-    A = A + torch.eye(n, dtype=dtype, device=device) * 3.0
+    # Dense-to-CSR on the CPU: MUSA registers no aten::_to_sparse_csr, and only
+    # the triples below need to be on the accelerator.
+    golden = golden_device()
+    A = torch.tril(torch.randn(n, n, dtype=dtype, device=golden) * 0.02)
+    A = A + torch.eye(n, dtype=dtype, device=golden) * 3.0
     b = _rand_like(dtype, (n,), device)
     Asp = A.to_sparse_csr()
 
@@ -1396,10 +1424,6 @@ def test_spsv_csr_transpose_family_supported_combos(n, dtype, index_dtype, op_mo
 
 
 @pytest.mark.spsv
-@pytest.mark.skipif(
-    cp is None or cpx_sparse is None or cpx_spsolve_triangular is None,
-    reason="CuPy/cuSPARSE required",
-)
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", NON_TRANS_DTYPES, ids=_dtype_id)
 def test_spsv_csr_matches_cusparse_non_trans(n, dtype):
@@ -1423,17 +1447,13 @@ def test_spsv_csr_matches_cusparse_non_trans(n, dtype):
         unit_diagonal=False,
         transpose=False,
     )
-    x_non_ref = _cupy_ref_spsv(A_cp, b, lower=True, unit_diagonal=False)
+    x_non_ref = _cusparse_or_scipy_ref_spsv(A, A_cp, b, lower=True, unit_diagonal=False)
 
     rtol, atol = _tol(dtype)
-    assert torch.allclose(x_non, x_non_ref, rtol=rtol, atol=atol)
+    assert torch.allclose(x_non.to(x_non_ref.device), x_non_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
-@pytest.mark.skipif(
-    cp is None or cpx_sparse is None or cpx_spsolve_triangular is None,
-    reason="CuPy/cuSPARSE required",
-)
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", TRANS_CONJ_DTYPES, ids=_dtype_id)
 @pytest.mark.parametrize(
@@ -1461,15 +1481,12 @@ def test_spsv_csr_matches_cusparse_transpose_family(n, dtype, index_dtype, op_mo
         unit_diagonal=False,
         transpose=_transpose_arg(op_mode),
     )
-    x_trans_ref = _cupy_ref_spsv(
-        _cupy_apply_op(A_cp, op_mode),
-        b,
-        lower=_effective_lower_for_op(True, op_mode),
-        unit_diagonal=False,
+    x_trans_ref = _cusparse_or_scipy_ref_spsv(
+        A, A_cp, b, lower=True, op_mode=op_mode, unit_diagonal=False
     )
 
     rtol, atol = _tol(dtype)
-    assert torch.allclose(x_trans, x_trans_ref, rtol=rtol, atol=atol)
+    assert torch.allclose(x_trans.to(x_trans_ref.device), x_trans_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
@@ -1546,10 +1563,6 @@ def test_spsv_csr_upper_transpose_family_supported_combos(
 
 
 @pytest.mark.spsv
-@pytest.mark.skipif(
-    cp is None or cpx_sparse is None or cpx_spsolve_triangular is None,
-    reason="CuPy/cuSPARSE required",
-)
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", NON_TRANS_DTYPES, ids=_dtype_id)
 def test_spsv_csr_matches_cusparse_upper_non_trans(n, dtype):
@@ -1573,17 +1586,13 @@ def test_spsv_csr_matches_cusparse_upper_non_trans(n, dtype):
         unit_diagonal=False,
         transpose=False,
     )
-    x_non_ref = _cupy_ref_spsv(A_cp, b, lower=False, unit_diagonal=False)
+    x_non_ref = _cusparse_or_scipy_ref_spsv(A, A_cp, b, lower=False, unit_diagonal=False)
 
     rtol, atol = _tol(dtype)
-    assert torch.allclose(x_non, x_non_ref, rtol=rtol, atol=atol)
+    assert torch.allclose(x_non.to(x_non_ref.device), x_non_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.spsv
-@pytest.mark.skipif(
-    cp is None or cpx_sparse is None or cpx_spsolve_triangular is None,
-    reason="CuPy/cuSPARSE required",
-)
 @pytest.mark.parametrize("n", SPSV_N)
 @pytest.mark.parametrize("dtype", TRANS_CONJ_DTYPES, ids=_dtype_id)
 @pytest.mark.parametrize(
@@ -1613,12 +1622,9 @@ def test_spsv_csr_matches_cusparse_upper_transpose_family(
         unit_diagonal=False,
         transpose=_transpose_arg(op_mode),
     )
-    x_trans_ref = _cupy_ref_spsv(
-        _cupy_apply_op(A_cp, op_mode),
-        b,
-        lower=_effective_lower_for_op(False, op_mode),
-        unit_diagonal=False,
+    x_trans_ref = _cusparse_or_scipy_ref_spsv(
+        A, A_cp, b, lower=False, op_mode=op_mode, unit_diagonal=False
     )
 
     rtol, atol = _tol(dtype)
-    assert torch.allclose(x_trans, x_trans_ref, rtol=rtol, atol=atol)
+    assert torch.allclose(x_trans.to(x_trans_ref.device), x_trans_ref, rtol=rtol, atol=atol)

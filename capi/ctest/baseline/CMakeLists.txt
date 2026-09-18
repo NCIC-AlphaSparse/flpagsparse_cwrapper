@@ -108,8 +108,13 @@ set(FLAGSPARSE_ASCEND_BASELINE_WHY
     "Ascend CANN has sparse ops via aclnn/torch_npu but no cuSPARSE-shaped descriptor API, so the prefix-table port does not apply; an op-by-op baseline adaptor has not been written -- see benchmark/benchmark_ascend_probe.py and docs/ASCEND.md")
 
 # ------------------------------------------------------------------ resolve
-# FLAGSPARSE_BACKEND is set by the top-level build; default CUDA.
-string(TOUPPER "${FLAGSPARSE_BACKEND}" _bl_backend)
+# BACKEND is the top-level cache variable (capi/CMakeLists.txt:23); default CUDA.
+# NOT FLAGSPARSE_BACKEND -- that name is the Python-side env var (values like
+# "mthreads"), a different variable with different spellings. Reading it here
+# silently no-ops: it is always empty, so _bl_backend always fell through to
+# CUDA regardless of -DBACKEND=..., and every non-CUDA build got "CUDA -> none"
+# instead of probing its own vendor library.
+string(TOUPPER "${BACKEND}" _bl_backend)
 if(NOT _bl_backend)
     set(_bl_backend "CUDA")
 endif()

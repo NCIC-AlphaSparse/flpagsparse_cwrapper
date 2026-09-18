@@ -103,6 +103,12 @@ target_link_libraries(flagsparse_testsupport
 # test_<operator>.cpp, one per API, in both directories (spec §6.2).
 # ctest names are "<phase>.<operator>" so `ctest -R accuracy` and `ctest -R spmv`
 # both select the way the spec documents.
+# Per-test ctest timeout. 900s covers the synthetic cases; a 30-matrix corpus
+# sweep over the full dtype grid does not, and the only way to raise it used to
+# be editing this literal. Same problem the Python runner solved with --timeout.
+set(FLAGSPARSE_CTEST_TIMEOUT "900" CACHE STRING
+    "Per-test timeout in seconds for C API ctest cases")
+
 function(flagsparse_add_test phase op)
     set(src "${CMAKE_CURRENT_SOURCE_DIR}/${phase}/test_${op}.cpp")
     if(NOT EXISTS "${src}")
@@ -119,7 +125,7 @@ function(flagsparse_add_test phase op)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${phase}")
     add_test(NAME "${phase}.${op}" COMMAND ${target})
     set_tests_properties("${phase}.${op}" PROPERTIES
-        TIMEOUT 900
+        TIMEOUT ${FLAGSPARSE_CTEST_TIMEOUT}
         LABELS "capi;${FLAGSPARSE_CTEST_PROFILE};${phase}")
 endfunction()
 

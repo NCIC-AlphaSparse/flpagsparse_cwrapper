@@ -175,24 +175,32 @@ CuPy/cuSPARSE is not applicable on the mthreads backend (baseline: torch)
 
 ## 4. 运行测试
 
-runner 本身没有 MUSA 特判，用通用命令即可：
+runner 本身没有 MUSA 特判。**交付用的命令是 0.5 节那条**（`--delivery-only --mode normal`），
+下面这组 `--mode quick` 的**只用于冒烟测试**——quick 会漏跑约四成用例，而且恰好跳过两个历史
+问题用例（见 `prompt.md` 第 3 节），照抄它产出的"验收"结果不算数：
 
 ```bash
 export PYTHONPATH=$PWD/src
 export FLAGSPARSE_BACKEND=mthreads
 
-# 精度
-python run_flagsparse_accuracy.py --mode quick --gpus 0
-
-# 性能
-python run_flagsparse_performance.py --ops spmv_csr,spmm_csr \
-  --benchmark-input matrix --benchmark-warmup 5 --benchmark-iters 20
-
-# 两阶段一起
-python run_flagsparse_pytest.py --phase both --mode quick --gpus 0 \
-  --benchmark-input matrix --benchmark-warmup 5 --benchmark-iters 20 \
-  --results-dir pytest_results_musa
+# 冒烟：只确认链路能通
+python run_flagsparse_pytest.py --phase accuracy --mode quick --gpus 0 \
+  --results-dir pytest_results_musa_smoke
 ```
+
+交付跑之前要知道的三条（2026-09-17 在 MTT S5000 上实测）：
+
+* **`--timeout 900` 不够。** 它是每个算子每个阶段的上限；30 个真实矩阵的完整 dtype 网格上，
+  spgemm / sddmm / spsv 的性能阶段会被 SIGKILL，结果要么 0 行、要么最后一个 dtype 还没轮到。
+  用 `--timeout 3600`。
+* **单卡，顺序跑。** 本机只有一张 MTT S5000，runner 一个算子接一个算子跑，不是并行；
+  **同一时刻不要再起任何碰 GPU 的任务**——精度结果不受争用影响，但并发期间的计时数字作废。
+  起手前先 `mthreads-gmi` 确认卡数和占用。
+* **总时长 ≈ 各算子组耗时之和**，按第 6 节的逐组耗时估，别按单个算子估。
+
+**性能想要加速比，走 `run_flagsparse_split_delivery.py`**：Python 侧 MUSA 没有厂商稀疏库
+（第 3 节），`--phase performance` 的分母恒为空；C API 侧有 muSPARSE 基线，这个 runner 精度取
+pytest、性能取 C API，合成一份 `summary_split.json`。见 `modified/MUSA.md` 第 12 节。
 
 单个算子脚本也可以直接跑：
 
@@ -350,7 +358,14 @@ python -u run_flagsparse_pytest.py \
 | `spmm_bell` | Skipped | 0 | 54 | 5.3 s |
 | **`spsv_sell`** | **TIMEOUT** | 0 | 0 | **900.4 s** |
 
-**`spsv_csr` 的 80 个 skip** 是 CuPy/cuSPARSE 比对用例，在 MUSA 上本就不适用，属正常。
+**`spsv_csr` 的 80 个 skip** ~~是 CuPy/cuSPARSE 比对用例，在 MUSA 上本就不适用，属正常~~
+—— **这个结论已被推翻**（2026-09-17）。`accuracy_utils.scipy_triangular_solve()` 早就写好了、
+docstring 明写"for MUSA accuracy tests"，只是从没接到这 4 组比对用例上；接上 SciPy fallback
+之后，80 个用例从 skipped 变成真正在比对，`spsv_csr` 为 **341 passed / 0 skipped**。
+
+> **教训**：见到 `cp is None → skip` 这类硬编码，先查 `accuracy_utils.py` 有没有现成但没接线的
+> fallback，不要直接认定"这个后端没法测"。这条"属正常"写于 2026-09-13，当时是对的，但没人在它
+> 过时的时候回来改——它是本文档自己的一个"没跑过就写没跑过"的反例。
 不要与更早的 quick 那轮（1212 passed / 105 skipped）混用 —— quick 只跑每个 marker 的子集。
 
 ---

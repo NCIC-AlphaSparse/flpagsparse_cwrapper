@@ -349,6 +349,24 @@ def _benchmark_pytorch_reference(data, indices, indptr, shape, B):
         return X_ref, f"SciPy reference unavailable ({exc})"
 
 
+def _record_vendor_ms(record):
+    """The vendor latency, from whichever canonical column holds it.
+
+    Records store it as cuSPARSE_ms or hipSPARSE_ms. The display label is
+    "CuPy/cuSPARSE" on CUDA and "N/A" on MUSA, so indexing a record with
+    f"{vendor_name}_ms" raised KeyError on EVERY backend. That print sat inside
+    the per-case try: after the good record had been appended, so every
+    successful case was followed by a phantom ERROR row with empty timings --
+    half of every spsm CSV was fake failures, which MUSA read as 11 of 15
+    matrices erroring when each had in fact passed one line earlier.
+    """
+    for key in ("cuSPARSE_ms", "hipSPARSE_ms"):
+        value = record.get(key)
+        if value is not None:
+            return value
+    return None
+
+
 def _benchmark_torch_reference(data, indices, indptr, shape, B):
     try:
         sparse_spsolve = getattr(torch.sparse, "spsolve", None)
@@ -1186,7 +1204,7 @@ def run_spsm_synthetic_all(n=512, n_rhs=1024):
                 print(
                     f"{fmt:>5} {_dtype_name(value_dtype):>9} {_dtype_name(index_dtype):>7} "
                     f"{shape[0]:>6} {n_rhs:>6} {one['nnz']:>10} "
-                    f"{_fmt_ms(one['FlagSparse_ms']):>10} {_fmt_ms(one[f'{vendor_name}_ms']):>10} "
+                    f"{_fmt_ms(one['FlagSparse_ms']):>10} {_fmt_ms(_record_vendor_ms(one)):>10} "
                     f"{_fmt_ratio(one['FlagSparse_vs_vendor_speedup']):>10} "
                     f"{one['status']:>10} {_fmt_err(one['err_ref']):>12} {_fmt_err(one['err_res']):>12} "
                     f"{_fmt_err(one['err_pt']):>12} {_fmt_err(one['err_vendor']):>12}"
@@ -1277,7 +1295,7 @@ def run_all_dtypes_spsm_csv(mtx_paths, csv_path, use_coo=False, n_rhs=1024):
                     print(
                         f"{short:<28} {base['value_dtype']:>9} {base['index_dtype']:>7} "
                         f"{record['n_rows']:>7} {record['n_rhs']:>6} {record['nnz']:>10} "
-                        f"{_fmt_ms(record['FlagSparse_ms']):>10} {_fmt_ms(record[f'{vendor_name}_ms']):>10} "
+                        f"{_fmt_ms(record['FlagSparse_ms']):>10} {_fmt_ms(_record_vendor_ms(record)):>10} "
                         f"{_fmt_ratio(record['FlagSparse_vs_vendor_speedup']):>10} "
                         f"{record['status']:>10} {_fmt_err(record['err_ref']):>12} {_fmt_err(record['err_res']):>12} "
                         f"{_fmt_err(record['err_pt']):>12} {_fmt_err(record['err_vendor']):>12}"
