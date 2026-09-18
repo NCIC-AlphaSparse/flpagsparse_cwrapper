@@ -643,6 +643,10 @@ ASCEND_PERFORMANCE_COMMANDS: dict[str, tuple[str, ...]] = {
             "benchmark/benchmark_ascend.py",
             "--op",
             "{op}",
+            # The .mtx file or directory from --benchmark-input; without it the
+            # script silently measured its built-in synthetic case instead.
+            "--input",
+            "{input}",
             "--device",
             "{device}",
             "--csv-summary",
@@ -1725,6 +1729,9 @@ def _resolve_path(project_root: Path, value: str | None) -> Path | None:
 # Operators whose sweep is run one matrix per subprocess, so a single hung matrix is
 # skippable instead of killing the whole operator's results.
 PER_MATRIX_PERFORMANCE_OPS = frozenset({"spmm_bell"})
+# On Ascend these two also run one .mtx per subprocess: real matrices differ by
+# orders of magnitude, and one slow input must not erase the rows that finished.
+ASCEND_PER_MATRIX_PERFORMANCE_OPS = frozenset({"spmm_csr", "sddmm_csr"})
 
 
 def parse_op_benchmark_args(values: list[str]) -> dict[str, list[str]]:
@@ -2355,7 +2362,11 @@ def run_performance(
     script_device = _subprocess_device_id(gpu_id)
 
     if (
-        (op in PER_MATRIX_PERFORMANCE_OPS or (backend == "xpu" and op in XPU_BASELINE_OPS))
+        (
+            op in PER_MATRIX_PERFORMANCE_OPS
+            or (backend == "xpu" and op in XPU_BASELINE_OPS)
+            or (backend == "ascend" and op in ASCEND_PER_MATRIX_PERFORMANCE_OPS)
+        )
         and benchmark_input is not None
         and benchmark_input.is_dir()
     ):

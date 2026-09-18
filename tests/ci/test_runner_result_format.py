@@ -758,3 +758,14 @@ def test_delivery_projection_keeps_a_timeout_distinct_from_not_run():
     assert timed_out["data"] == {}
     empty = runner._delivery_performance_phase({"status": "PASS"}, "f32")
     assert empty["status"] == "NOT_CONFIGURED"
+
+
+def test_ascend_benchmark_commands_pass_the_matrix_input_the_script_accepts():
+    # The runner resolved --benchmark-input but never handed it to
+    # benchmark_ascend.py, so "30 real matrices" runs measured the synthetic case.
+    script = (ROOT / "benchmark" / "benchmark_ascend.py").read_text(encoding="utf-8")
+    assert '"--input"' in script
+    for op in runner.ASCEND_BASELINE_OPS:
+        template = runner.ASCEND_PERFORMANCE_COMMANDS[op]
+        assert template[template.index("--input") + 1] == "{input}"
+        assert "bfloat16" not in template[template.index("--dtypes") + 1]

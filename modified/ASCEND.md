@@ -319,7 +319,7 @@ setsid timeout -k 15s -s KILL 7200s \
 ## 7. 合并记录（2026-09-18，合入 `86a09cd` 之上）
 
 本台账只有文字描述、没有补丁，且各节对改了几个文件的说法不一致（开头说 4 个，§1.2 列了 5 个，
-§5 说 2 个）。**只合入了有完整代码、且不依赖其他未合改动的 3 处**，均**未在 NPU 上验证**：
+§5 说 2 个）。**只合入了有完整代码、且不依赖其他未合改动的 3 处**，已于 2026-09-18 在 910B4（NPU 6）上验证通过，结果见本节末「NPU 实机验证」：
 
 | 台账位置 | 合入内容 | 合并时的差异 |
 |---|---|---|
@@ -336,11 +336,28 @@ setsid timeout -k 15s -s KILL 7200s \
 | `ASCEND_PERFORMANCE_COMMANDS` 去掉 `bfloat16` | bf16 不是交付 dtype |
 | `_delivery_performance_phase()`：父任务 `TIMEOUT` 且没有该 dtype 的行时保留 `Timeout` | 合进 `86a09cd` 重写后的函数；新增 CI 用例 |
 
-**仍缺，等文件再合**（`spsv.py` 和 `benchmark/benchmark_ascend.py` 都没有发过来）：
+**第三批（2026-09-18，Ascend 回传了 `spsv.py` 和 `benchmark/benchmark_ascend.py`）**：本台账描述的改动至此全部合入。
 
-- runner：`ASCEND_PERFORMANCE_COMMANDS` 加 `--input {input}`；`ASCEND_PER_MATRIX_PERFORMANCE_OPS`（spmm_csr、sddmm_csr
-  逐矩阵隔离）。这两处 runner 代码已经拿到，但都要把 `.mtx` 路径传给 `benchmark_ascend.py --input`，
-  **必须和下一条同时合**，否则仓库版 `benchmark_ascend.py` 不认该参数、性能阶段全部失败；
-- `benchmark/benchmark_ascend.py`：`.mtx` 输入、`--op` 选择性执行、`matrix` 列、SDDMM 分块参考；
-- `spsv.py` 的 `_spsv_ascend_row_sweep()`：台账只有算法描述。合入前要改一处——"无对角值时写入零"会静默
-  给出错误解，应当报错。
+| 文件 | 合入内容 | 合并时的差异 / 验证 |
+|---|---|---|
+| `benchmark/benchmark_ascend.py` | `.mtx` 输入（`--input` 接受文件或目录）、`run(op=...)` 只跑指定算子、CSV 加 `matrix` 列、SDDMM 的 SciPy 参考和 PyTorch-NPU 基线都分块 | 原样合入。本机只验证了 CLI；NPU 上未跑 |
+| `src/flagsparse/sparse_operations/spsv.py` | `_spsv_ascend_row_sweep()` 逐行求解；`_execute_spsv_csr_plan()` 在 Ascend 上分流，转置显式 `NotImplementedError` | **改了一处**：对角元绝对值小于 `_spsv_diag_eps_for_dtype()` 时按 1 除，与 Triton 内核的 `diag_safe` 一致（原版直接除，会得到极大值）。缺对角元写 0 与 Triton 内核一致，保留（前面"应当报错"的说法收回）。在 CUDA 上强制走该分支，与 Triton 结果对比：f32 ≤ 6e-5、f64 ≤ 3e-13，上/下三角、单位/非单位对角都一致 |
+| `run_flagsparse_pytest.py` | `ASCEND_PERFORMANCE_COMMANDS` 加 `--input {input}`；`ASCEND_PER_MATRIX_PERFORMANCE_OPS = {spmm_csr, sddmm_csr}`，与 XPU 的逐矩阵条件并列 | 新增 CI 用例：5 个 Ascend 模板都带 `--input {input}`、不含 bf16，且 `benchmark_ascend.py` 确实认 `--input` |
+
+**注意**：SpSV 回退是逐行的 torch 循环，每行都有 host 同步，是正确性兜底，不是高吞吐实现；在百万行的
+真实矩阵上会非常慢。Ascend 的 SpSV 性能走探测脚本，不出加速比，报告时不要把它的耗时当成内核性能。
+
+### NPU 实机验证（2026-09-18，910B4，NPU 6，代码 `7ec9add`）
+
+| 项 | 命令要点 | 结果 |
+|---|---|---|
+| 设备隔离：pytest 路径 | `--ops spmv_coo --phase accuracy --gpus 6` | 子进程（PID 大于 runner）出现在 **NPU 6**，NPU 0 无新进程。精度 41 通过 / 36 失败，失败全是 float64、complex128 各 18 个，与 §3 记录一致（NPU 的 double 限制） |
+| 设备隔离：专用脚本路径 | `--ops gather --phase both --gpus 6` | 精度、性能子进程命令都是 `--device 0`，两阶段 Passed |
+| SDDMM 分块：精度 | `benchmark_ascend_accuracy.py --op sddmm_csr` | float16 / float32 / **float64** 全部 passed |
+| SDDMM 分块：大矩阵 | 100 万 × 100 万、nnz = 500 万、K = 64 | 不再 OOM（旧写法要 ~4 TB 稠密矩阵），2.55 s，1 万个抽样最大误差 3.8e-6 |
+| f16 精度脚本 | `benchmark_ascend_accuracy.py --op gather/scatter` | 两个算子的 float16 / float32 / float64 全部 passed |
+| f16 交付投影 | `--ops gather,scatter --delivery-only --phase accuracy` | `gather_f16_int`、`scatter_f16_int` 均为 **Passed**（此前 NF） |
+
+**顺带解决的问题**：§3 里 `sddmm_csr_f64_int_non_non_row` 的精度 0/1/1、性能 Error（`DT_DOUBLE` matmul 不支持）。
+旧实现先算 `torch.matmul(x, y.T)`，NPU 的 matmul 不支持 double；分块实现只用逐元素乘和求和，不再调用
+matmul，float64 精度已通过。性能是否也不再报错，要等下一轮交付测试确认。
